@@ -28,11 +28,20 @@ interface ApiProvider {
   description?: string;
 }
 
+type UsageSourceType = 'account' | 'api' | 'unknown';
+
+interface UsageAttributionEvent {
+  timestamp: number;
+  sourceType: Exclude<UsageSourceType, 'unknown'>;
+  sourceName: string;
+}
+
 interface Config {
   accounts: Account[];
   currentAccount?: string;
   apiProviders?: ApiProvider[];
   currentApiProvider?: string;
+  usageAttributionHistory?: UsageAttributionEvent[];
 }
 
 interface Credentials {
@@ -41,6 +50,7 @@ interface Credentials {
     refreshToken?: string;
     expiresAt?: number;
     subscriptionType?: string;
+    rateLimitTier?: string;
     scopes?: string[];
   };
 }
@@ -50,6 +60,21 @@ interface ClaudeJson {
     emailAddress?: string;
     displayName?: string;
     organizationName?: string;
+  };
+}
+
+interface OAuthProfile {
+  account?: {
+    email?: string;
+    display_name?: string;
+    full_name?: string;
+    has_claude_max?: boolean;
+    has_claude_pro?: boolean;
+  };
+  organization?: {
+    name?: string;
+    organization_type?: string;
+    rate_limit_tier?: string;
   };
 }
 
@@ -80,15 +105,100 @@ interface UsageData {
   };
 }
 
+interface TokenTotals {
+  input: number;
+  output: number;
+  cacheCreate: number;
+  cacheRead: number;
+  cost: number;
+  requests: number;
+}
+
+interface ModelTokenStats extends TokenTotals {
+  model: string;
+}
+
+interface DayModelTokenStats extends ModelTokenStats {
+  date: string;
+}
+
+interface DailyTokenStats extends TokenTotals {
+  date: string;
+}
+
+interface SourceTokenStats extends TokenTotals {
+  sourceType: UsageSourceType;
+  sourceName: string;
+  sourceLabel: string;
+}
+
+interface SourceDailyTokenStats extends DailyTokenStats {
+  sourceType: UsageSourceType;
+  sourceName: string;
+  sourceLabel: string;
+}
+
+interface LocalTokenStats {
+  totals: TokenTotals;
+  byKind: Record<UsageSourceType, TokenTotals>;
+  bySource: SourceTokenStats[];
+  bySourceDay: SourceDailyTokenStats[];
+  byModel: ModelTokenStats[];
+  byDayModel: DayModelTokenStats[];
+  byDay: DailyTokenStats[];
+  filesScanned: number;
+  recordsScanned: number;
+  updatedAt: number;
+}
+
+interface ModelPricing {
+  input: number;
+  output: number;
+  cacheCreate: number;
+  cacheRead: number;
+}
+
+interface ClaudeTranscriptEntry {
+  timestamp?: string;
+  type?: string;
+  message?: {
+    role?: string;
+    model?: string;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+    };
+  };
+}
+
 // ─── OAuth 常量 ───────────────────────────────────────────────────────────────
 
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://claude.ai/api/oauth/token';
+const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+const CLAUDE_PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
+
+// USD per 1M tokens. Anthropic lists Opus 4.8 at the same standard API price
+// as Opus 4.7: $5/M input and $25/M output. Keep this table easy to update
+// when model names or pricing change.
+const MODEL_PRICING: { match: RegExp; pricing: ModelPricing }[] = [
+  { match: /opus[-_\s]?4(?:[._-]?(?:8|7|6|5))/i, pricing: { input: 5, output: 25, cacheCreate: 6.25, cacheRead: 0.5 } },
+  { match: /opus[-_\s]?4(?:[._-]?1)?(?:-\d{8})?$/i, pricing: { input: 15, output: 75, cacheCreate: 18.75, cacheRead: 1.5 } },
+  { match: /opus/i, pricing: { input: 5, output: 25, cacheCreate: 6.25, cacheRead: 0.5 } },
+  { match: /sonnet/i, pricing: { input: 3, output: 15, cacheCreate: 3.75, cacheRead: 0.3 } },
+  { match: /haiku[-_\s]?3\.5|haiku[-_\s]?3-5/i, pricing: { input: 0.8, output: 4, cacheCreate: 1, cacheRead: 0.08 } },
+  { match: /haiku/i, pricing: { input: 1, output: 5, cacheCreate: 1.25, cacheRead: 0.1 } },
+];
 
 // ─── 使用量缓存（内存，5分钟 TTL）────────────────────────────────────────────
 
 const usageCache = new Map<string, { data: UsageData; fetchedAt: number }>();
+let localStatsCache: { data: LocalTokenStats; fetchedAt: number } | undefined;
 const CACHE_TTL = 5 * 60 * 1000;
+const AUTO_REFRESH_INTERVAL_MS = CACHE_TTL;
 
 // ─── 配置文件操作 ─────────────────────────────────────────────────────────────
 
@@ -106,6 +216,76 @@ function saveConfig(config: Config): void {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
 }
 
+function appendUsageAttribution(
+  config: Config,
+  sourceType: Exclude<UsageSourceType, 'unknown'>,
+  sourceName: string,
+  timestamp = Date.now()
+): void {
+  config.usageAttributionHistory = config.usageAttributionHistory ?? [];
+  const last = config.usageAttributionHistory[config.usageAttributionHistory.length - 1];
+  if (last && last.sourceType === sourceType && last.sourceName === sourceName) {
+    return;
+  }
+  config.usageAttributionHistory.push({ timestamp, sourceType, sourceName });
+  localStatsCache = undefined;
+}
+
+function getSortedAttributionHistory(config: Config): UsageAttributionEvent[] {
+  return (config.usageAttributionHistory ?? [])
+    .filter((event) =>
+      Number.isFinite(event.timestamp) &&
+      (event.sourceType === 'account' || event.sourceType === 'api') &&
+      Boolean(event.sourceName)
+    )
+    .sort((a, b) => a.timestamp - b.timestamp);
+}
+
+function getSourceLabel(sourceType: UsageSourceType, sourceName: string): string {
+  if (sourceType === 'account') { return `账号: ${sourceName}`; }
+  if (sourceType === 'api') { return `API: ${sourceName}`; }
+  return '未归因';
+}
+
+function sourceKey(sourceType: UsageSourceType, sourceName: string): string {
+  return `${sourceType}:${sourceName || 'unknown'}`;
+}
+
+function resolveUsageSourceAt(timestamp: number, history: UsageAttributionEvent[]): { sourceType: UsageSourceType; sourceName: string; sourceLabel: string } {
+  if (!Number.isFinite(timestamp) || history.length === 0 || timestamp < history[0].timestamp) {
+    return { sourceType: 'unknown', sourceName: 'unknown', sourceLabel: '未归因' };
+  }
+
+  let match = history[0];
+  for (const event of history) {
+    if (event.timestamp <= timestamp) {
+      match = event;
+    } else {
+      break;
+    }
+  }
+  return {
+    sourceType: match.sourceType,
+    sourceName: match.sourceName,
+    sourceLabel: getSourceLabel(match.sourceType, match.sourceName),
+  };
+}
+
+function ensureCurrentUsageAttribution(): void {
+  const config = loadConfig();
+  if (config.currentApiProvider) {
+    appendUsageAttribution(config, 'api', config.currentApiProvider);
+    saveConfig(config);
+    return;
+  }
+
+  const currentAccount = detectCurrentAccount(config);
+  if (currentAccount) {
+    appendUsageAttribution(config, 'account', currentAccount);
+    saveConfig(config);
+  }
+}
+
 function getAccountDir(name: string): string {
   return path.join(ACCOUNTS_DIR, name);
 }
@@ -116,6 +296,17 @@ function getAccountCredPath(name: string): string {
 
 function getAccountClaudeJsonPath(name: string): string {
   return path.join(getAccountDir(name), '.claude.json');
+}
+
+function normalizeExpiresAt(expiresAt: number): number {
+  // Claude Code currently stores milliseconds. Keep seconds support for older
+  // or manually imported credentials.
+  return expiresAt > 0 && expiresAt < 10_000_000_000 ? expiresAt * 1000 : expiresAt;
+}
+
+function shouldRefreshToken(expiresAt: number | undefined): boolean {
+  if (!expiresAt) { return true; }
+  return normalizeExpiresAt(expiresAt) <= Date.now() + TOKEN_REFRESH_SKEW_MS;
 }
 
 // ─── 账户信息读取 ─────────────────────────────────────────────────────────────
@@ -133,7 +324,7 @@ function readAccountInfo(accountName: string): AccountInfo | null {
 
     // 如果存储的 accessToken 已过期，检查是否是当前激活账户
     // Claude Code 会自动刷新活跃账户的 token，但不会同步回账户目录
-    if (expiresAt < Date.now() && fs.existsSync(CLAUDE_CREDS)) {
+    if (shouldRefreshToken(expiresAt) && fs.existsSync(CLAUDE_CREDS)) {
       try {
         const config = loadConfig();
         if (config.currentAccount === accountName) {
@@ -162,6 +353,9 @@ function readAccountInfo(accountName: string): AccountInfo | null {
       email = claudeJson?.oauthAccount?.emailAddress ?? '';
       displayName = claudeJson?.oauthAccount?.displayName ?? '';
       organization = claudeJson?.oauthAccount?.organizationName ?? '';
+    }
+    if (!organization && creds?.claudeAiOauth?.rateLimitTier) {
+      organization = creds.claudeAiOauth.rateLimitTier;
     }
 
     return { email, displayName, organization, plan, refreshToken, accessToken };
@@ -244,6 +438,71 @@ async function fetchUsage(accessToken: string): Promise<UsageData | null> {
   }
 }
 
+async function fetchOAuthProfile(accessToken: string): Promise<OAuthProfile | null> {
+  try {
+    const res = await fetch(OAUTH_PROFILE_URL, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+    });
+    if (!res.ok) {
+      return null;
+    }
+    return (await res.json()) as OAuthProfile;
+  } catch {
+    return null;
+  }
+}
+
+function profileToClaudeJson(profile: OAuthProfile): ClaudeJson {
+  return {
+    oauthAccount: {
+      emailAddress: profile.account?.email ?? '',
+      displayName: profile.account?.display_name ?? profile.account?.full_name ?? '',
+      organizationName: profile.organization?.name ?? '',
+    },
+  };
+}
+
+function getPlanFromProfile(profile: OAuthProfile): string {
+  if (profile.account?.has_claude_max) { return 'max'; }
+  if (profile.account?.has_claude_pro) { return 'pro'; }
+  return profile.organization?.organization_type ?? '';
+}
+
+function updateCredentialsPlanFromProfile(credPath: string, profile: OAuthProfile): void {
+  const plan = getPlanFromProfile(profile);
+  const tier = profile.organization?.rate_limit_tier;
+  if (!plan && !tier) { return; }
+  try {
+    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+    if (!creds.claudeAiOauth) { return; }
+    if (plan) {
+      creds.claudeAiOauth.subscriptionType = plan;
+    }
+    if (tier) {
+      creds.claudeAiOauth.rateLimitTier = tier;
+    }
+    fs.writeFileSync(credPath, JSON.stringify(creds, null, 2), 'utf-8');
+  } catch {}
+}
+
+async function cacheProfileForCredentials(credPath: string, claudeJsonPath: string): Promise<OAuthProfile | null> {
+  try {
+    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+    const accessToken = creds?.claudeAiOauth?.accessToken;
+    if (!accessToken) { return null; }
+    const profile = await fetchOAuthProfile(accessToken);
+    if (!profile) { return null; }
+    fs.writeFileSync(claudeJsonPath, JSON.stringify(profileToClaudeJson(profile), null, 2), 'utf-8');
+    updateCredentialsPlanFromProfile(credPath, profile);
+    return profile;
+  } catch {
+    return null;
+  }
+}
+
 async function getUsage(accountName: string): Promise<UsageData | null> {
   const cached = usageCache.get(accountName);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) {
@@ -261,7 +520,7 @@ async function getUsage(accountName: string): Promise<UsageData | null> {
   try {
     const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
     const expiresAt = creds?.claudeAiOauth?.expiresAt ?? 0;
-    if (expiresAt < Date.now()) {
+    if (shouldRefreshToken(expiresAt)) {
       const newToken = await refreshOAuthToken(accountName);
       if (newToken) { accessToken = newToken; }
     }
@@ -336,7 +595,7 @@ async function switchToAccount(name: string): Promise<void> {
   // 这样复制到活跃位置时 Claude Code 能直接使用，无需重新登录
   try {
     const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
-    if ((creds?.claudeAiOauth?.expiresAt ?? 0) < Date.now()) {
+    if (shouldRefreshToken(creds?.claudeAiOauth?.expiresAt)) {
       await refreshOAuthToken(name);
     }
   } catch {}
@@ -353,6 +612,7 @@ async function switchToAccount(name: string): Promise<void> {
 
   config.currentAccount = name;
   config.currentApiProvider = undefined; // 清除 API Provider 模式
+  appendUsageAttribution(config, 'account', name);
   saveConfig(config);
   clearApiProviderSettings();
 }
@@ -398,6 +658,7 @@ function switchToApiProvider(name: string): void {
 
   config.currentApiProvider = name;
   config.currentAccount = undefined; // 清除 OAuth 账户模式
+  appendUsageAttribution(config, 'api', name);
   saveConfig(config);
 }
 
@@ -455,16 +716,412 @@ function usageColor(n: number): string {
   return '#4caf50';
 }
 
+// ─── 本地 Token/成本统计 ─────────────────────────────────────────────────────
+
+function emptyTotals(): TokenTotals {
+  return { input: 0, output: 0, cacheCreate: 0, cacheRead: 0, cost: 0, requests: 0 };
+}
+
+function cloneTotals(value: TokenTotals): TokenTotals {
+  return {
+    input: value.input,
+    output: value.output,
+    cacheCreate: value.cacheCreate,
+    cacheRead: value.cacheRead,
+    cost: value.cost,
+    requests: value.requests,
+  };
+}
+
+function addTotals(target: TokenTotals, delta: TokenTotals): void {
+  target.input += delta.input;
+  target.output += delta.output;
+  target.cacheCreate += delta.cacheCreate;
+  target.cacheRead += delta.cacheRead;
+  target.cost += delta.cost;
+  target.requests += delta.requests;
+}
+
+function getPricingForModel(model: string): ModelPricing | null {
+  for (const item of MODEL_PRICING) {
+    if (item.match.test(model)) {
+      return item.pricing;
+    }
+  }
+  return null;
+}
+
+function calculateCost(model: string, input: number, output: number, cacheCreate: number, cacheRead: number): number {
+  const pricing = getPricingForModel(model);
+  if (!pricing) { return 0; }
+  return (
+    input * pricing.input +
+    output * pricing.output +
+    cacheCreate * pricing.cacheCreate +
+    cacheRead * pricing.cacheRead
+  ) / 1_000_000;
+}
+
+function formatCompactNumber(n: number): string {
+  return Math.round(n).toLocaleString();
+}
+
+function formatTokenShort(n: number): string {
+  if (n >= 1_000_000) { return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`; }
+  if (n >= 1_000) { return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`; }
+  return Math.round(n).toString();
+}
+
+function formatUsd(n: number): string {
+  if (n === 0) { return '$0.00'; }
+  if (n < 0.01) { return `<$0.01`; }
+  return `$${n.toFixed(2)}`;
+}
+
+function totalTokens(value: TokenTotals | undefined): number {
+  if (!value) { return 0; }
+  return value.input + value.output + value.cacheCreate + value.cacheRead;
+}
+
+function getJsonlFiles(dir: string): string[] {
+  const files: string[] = [];
+  if (!fs.existsSync(dir)) { return files; }
+
+  const walk = (current: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        files.push(full);
+      }
+    }
+  };
+
+  walk(dir);
+  return files;
+}
+
+function getEntryDate(timestamp: string | undefined): string {
+  const d = timestamp ? new Date(timestamp) : new Date();
+  if (Number.isNaN(d.getTime())) {
+    return new Date().toISOString().slice(0, 10);
+  }
+  return formatLocalDate(d);
+}
+
+function formatLocalDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function getLocalTokenStats(force = false): LocalTokenStats {
+  if (!force && localStatsCache && Date.now() - localStatsCache.fetchedAt < CACHE_TTL) {
+    return localStatsCache.data;
+  }
+
+  const totals = emptyTotals();
+  const byKind: Record<UsageSourceType, TokenTotals> = {
+    account: emptyTotals(),
+    api: emptyTotals(),
+    unknown: emptyTotals(),
+  };
+  const bySource = new Map<string, SourceTokenStats>();
+  const bySourceDay = new Map<string, SourceDailyTokenStats>();
+  const byModel = new Map<string, TokenTotals>();
+  const byDayModel = new Map<string, DayModelTokenStats>();
+  const byDay = new Map<string, TokenTotals>();
+  const files = getJsonlFiles(CLAUDE_PROJECTS_DIR);
+  const attributionHistory = getSortedAttributionHistory(loadConfig());
+  let recordsScanned = 0;
+
+  for (const file of files) {
+    let lines: string[];
+    try {
+      lines = fs.readFileSync(file, 'utf-8').split(/\r?\n/);
+    } catch {
+      continue;
+    }
+
+    for (const line of lines) {
+      if (!line.trim()) { continue; }
+      let entry: ClaudeTranscriptEntry;
+      try {
+        entry = JSON.parse(line) as ClaudeTranscriptEntry;
+      } catch {
+        continue;
+      }
+
+      const usage = entry.message?.usage;
+      if (entry.type !== 'assistant' || entry.message?.role !== 'assistant' || !usage) {
+        continue;
+      }
+
+      const model = entry.message.model ?? 'unknown';
+      const input = Number(usage.input_tokens ?? 0);
+      const output = Number(usage.output_tokens ?? 0);
+      const cacheCreate = Number(usage.cache_creation_input_tokens ?? 0);
+      const cacheRead = Number(usage.cache_read_input_tokens ?? 0);
+      if (input + output + cacheCreate + cacheRead === 0) {
+        continue;
+      }
+
+      recordsScanned++;
+      const delta: TokenTotals = {
+        input,
+        output,
+        cacheCreate,
+        cacheRead,
+        cost: calculateCost(model, input, output, cacheCreate, cacheRead),
+        requests: 1,
+      };
+
+      addTotals(totals, delta);
+      const timestampMs = entry.timestamp ? new Date(entry.timestamp).getTime() : Number.NaN;
+      const source = resolveUsageSourceAt(timestampMs, attributionHistory);
+      addTotals(byKind[source.sourceType], delta);
+
+      const srcKey = sourceKey(source.sourceType, source.sourceName);
+      const sourceTotals = bySource.get(srcKey) ?? {
+        sourceType: source.sourceType,
+        sourceName: source.sourceName,
+        sourceLabel: source.sourceLabel,
+        ...emptyTotals(),
+      };
+      addTotals(sourceTotals, delta);
+      bySource.set(srcKey, sourceTotals);
+
+      const modelTotals = byModel.get(model) ?? emptyTotals();
+      addTotals(modelTotals, delta);
+      byModel.set(model, modelTotals);
+
+      const day = getEntryDate(entry.timestamp);
+      const dayTotals = byDay.get(day) ?? emptyTotals();
+      addTotals(dayTotals, delta);
+      byDay.set(day, dayTotals);
+
+      const dayModelKey = `${day}:${model}`;
+      const dayModelTotals = byDayModel.get(dayModelKey) ?? {
+        date: day,
+        model,
+        ...emptyTotals(),
+      };
+      addTotals(dayModelTotals, delta);
+      byDayModel.set(dayModelKey, dayModelTotals);
+
+      const srcDayKey = `${srcKey}:${day}`;
+      const sourceDayTotals = bySourceDay.get(srcDayKey) ?? {
+        sourceType: source.sourceType,
+        sourceName: source.sourceName,
+        sourceLabel: source.sourceLabel,
+        date: day,
+        ...emptyTotals(),
+      };
+      addTotals(sourceDayTotals, delta);
+      bySourceDay.set(srcDayKey, sourceDayTotals);
+    }
+  }
+
+  const data: LocalTokenStats = {
+    totals,
+    byKind,
+    bySource: Array.from(bySource.values())
+      .sort((a, b) => b.cost - a.cost || totalTokens(b) - totalTokens(a)),
+    bySourceDay: Array.from(bySourceDay.values())
+      .sort((a, b) => b.date.localeCompare(a.date) || a.sourceLabel.localeCompare(b.sourceLabel)),
+    byModel: Array.from(byModel.entries())
+      .map(([model, value]) => ({ model, ...value }))
+      .sort((a, b) => b.cost - a.cost || b.output - a.output),
+    byDayModel: Array.from(byDayModel.values())
+      .sort((a, b) => b.date.localeCompare(a.date) || b.cost - a.cost || b.output - a.output),
+    byDay: Array.from(byDay.entries())
+      .map(([date, value]) => ({ date, ...value }))
+      .sort((a, b) => b.date.localeCompare(a.date)),
+    filesScanned: files.length,
+    recordsScanned,
+    updatedAt: Date.now(),
+  };
+
+  localStatsCache = { data, fetchedAt: Date.now() };
+  return data;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function getSourceDayTotals(stats: LocalTokenStats, sourceType: UsageSourceType, sourceName: string, date: string): SourceDailyTokenStats | undefined {
+  return stats.bySourceDay.find((row) =>
+    row.sourceType === sourceType &&
+    row.sourceName === sourceName &&
+    row.date === date
+  );
+}
+
+function formatTotalsInline(value: TokenTotals | undefined): string {
+  const tokens = totalTokens(value);
+  return `${formatTokenShort(tokens)} tok · ${formatUsd(value?.cost ?? 0)}`;
+}
+
+function buildTotalsCells(value: TokenTotals): string {
+  return [
+    `<td>${formatCompactNumber(value.input)}</td>`,
+    `<td>${formatCompactNumber(value.output)}</td>`,
+    `<td>${formatCompactNumber(value.cacheCreate)}</td>`,
+    `<td>${formatCompactNumber(value.cacheRead)}</td>`,
+    `<td>${formatCompactNumber(value.requests)}</td>`,
+    `<td>${formatUsd(value.cost)}</td>`,
+  ].join('');
+}
+
+function buildHeatmapHtml(stats: LocalTokenStats, days = 182): string {
+  const today = new Date();
+  const values = new Map(stats.byDay.map((row) => [row.date, totalTokens(row)]));
+  const max = Math.max(1, ...Array.from(values.values()));
+  const cells: string[] = [];
+  const start = new Date(today);
+  start.setDate(today.getDate() - (days - 1));
+  const startWeekday = start.getDay();
+  const columns = Math.ceil((days + startWeekday) / 7);
+
+  for (let index = 0; index < days; index++) {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    const key = formatLocalDate(date);
+    const value = values.get(key) ?? 0;
+    const level = value === 0 ? 0 : Math.max(1, Math.min(4, Math.ceil((value / max) * 4)));
+    const rowIndex = date.getDay() + 1;
+    const columnIndex = Math.floor((startWeekday + index) / 7) + 1;
+    const row = stats.byDay.find((item) => item.date === key);
+    const tooltip = row
+      ? `${key}\nToken: ${formatCompactNumber(value)}\n输入: ${formatCompactNumber(row.input)}\n输出: ${formatCompactNumber(row.output)}\n缓存写入: ${formatCompactNumber(row.cacheCreate)}\n缓存读取: ${formatCompactNumber(row.cacheRead)}\n费用: ${formatUsd(row.cost)}`
+      : `${key}\n无用量`;
+    cells.push(`<div class="heat-cell heat-${level}" style="grid-row:${rowIndex};grid-column:${columnIndex}" title="${escapeHtml(tooltip)}"></div>`);
+  }
+
+  return `<div class="heat-axis-x">横轴：日期，从左到右接近今天</div>
+  <div class="heat-layout">
+    <div class="heat-axis-y">
+      <span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span>
+    </div>
+    <div class="heatmap-wrap">
+      <div class="heatmap" style="grid-template-columns: repeat(${columns}, 16px)">${cells.join('')}</div>
+    </div>
+  </div>
+  <div class="heat-footer">
+    <span>纵轴：星期</span>
+    <span class="heat-legend"><span>少</span><span class="heat-cell heat-1"></span><span class="heat-cell heat-2"></span><span class="heat-cell heat-3"></span><span class="heat-cell heat-4"></span><span>多</span></span>
+  </div>`;
+}
+
+function buildDailyCombinedRows(stats: LocalTokenStats): string {
+  return stats.byDay.slice(0, 45).map((day) => {
+    const sources = stats.bySourceDay
+      .filter((row) => row.date === day.date)
+      .sort((a, b) => {
+        const order = { account: 0, api: 1, unknown: 2 } as Record<UsageSourceType, number>;
+        return order[a.sourceType] - order[b.sourceType] || b.cost - a.cost;
+      });
+    const sourceRows = sources.map((row) => `
+      <tr class="source-day-row">
+        <td></td>
+        <td>${escapeHtml(row.sourceLabel)}</td>
+        ${buildTotalsCells(row)}
+      </tr>
+    `).join('');
+    return `
+      <tr class="daily-total-row">
+        <td>${day.date}</td>
+        <td>全部</td>
+        ${buildTotalsCells(day)}
+      </tr>
+      ${sourceRows}
+    `;
+  }).join('');
+}
+
 // ─── Webview 使用量面板 ───────────────────────────────────────────────────────
 
 function buildUsageHtml(
-  accounts: { name: string; info: AccountInfo | null; usage: UsageData | null }[]
+  accounts: { name: string; info: AccountInfo | null; usage: UsageData | null }[],
+  localStats?: LocalTokenStats
 ): string {
+  const tokenSummary = localStats ? `
+    <section class="summary-grid">
+      <div class="metric-card"><div class="metric-label">累计 Token</div><div class="metric-value">${formatCompactNumber(totalTokens(localStats.totals))}</div></div>
+      <div class="metric-card"><div class="metric-label">累计费用</div><div class="metric-value">${formatUsd(localStats.totals.cost)}</div></div>
+      <div class="metric-card"><div class="metric-label">账号调用</div><div class="metric-value">${formatTotalsInline(localStats.byKind.account)}</div></div>
+      <div class="metric-card"><div class="metric-label">API 调用</div><div class="metric-value">${formatTotalsInline(localStats.byKind.api)}</div></div>
+      <div class="metric-card"><div class="metric-label">未归因</div><div class="metric-value">${formatTotalsInline(localStats.byKind.unknown)}</div></div>
+      <div class="metric-card"><div class="metric-label">请求数</div><div class="metric-value">${formatCompactNumber(localStats.totals.requests)}</div></div>
+    </section>
+    <div class="stats-meta">扫描 ${localStats.filesScanned} 个日志文件，${localStats.recordsScanned} 条 assistant usage 记录；更新时间 ${new Date(localStats.updatedAt).toLocaleString()}</div>
+  ` : `<div class="dim">正在读取本地 Claude Code 用量日志...</div>`;
+
+  const sourceRows = localStats?.bySource.map((row) => `
+    <tr>
+      <td>${escapeHtml(row.sourceLabel)}</td>
+      ${buildTotalsCells(row)}
+    </tr>
+  `).join('') ?? '';
+
+  const modelRows = localStats?.byModel.slice(0, 20).map((row) => `
+    <tr>
+      <td class="mono">${escapeHtml(row.model)}</td>
+      ${buildTotalsCells(row)}
+    </tr>
+  `).join('') ?? '';
+
+  const dailyCombinedRows = localStats ? buildDailyCombinedRows(localStats) : '';
+
+  const topStatsHtml = `
+    <section class="section-block">
+      <h2>全局累计</h2>
+      ${tokenSummary}
+      <div class="note">价格按内置公开 API 价格表估算，仅用于比较模型/日期消耗；订阅账号实际额度扣减不等同于 API 账单。</div>
+    </section>
+    <section class="section-block">
+      <h2>使用热力图</h2>
+      ${localStats ? buildHeatmapHtml(localStats) : ''}
+    </section>
+  `;
+
+  const detailStatsHtml = `
+    <section class="section-block">
+      <h2>来源累计</h2>
+      <table>
+        <thead><tr><th>来源</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+        <tbody>${sourceRows || '<tr><td colspan="7" class="dim">暂无来源统计；后续通过 CC Manager 切换后会开始归因</td></tr>'}</tbody>
+      </table>
+    </section>
+    <section class="section-block">
+      <h2>模型用量</h2>
+      <table>
+        <thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+        <tbody>${modelRows || '<tr><td colspan="7" class="dim">暂无模型用量记录</td></tr>'}</tbody>
+      </table>
+    </section>
+  `;
+
   const cards = accounts
     .map(({ name, info, usage }) => {
-      const email = info?.email ?? '—';
+      const email = escapeHtml(info?.email ?? '—');
       const plan = info?.plan === 'pro' ? 'Claude Pro' : (info?.plan ?? '—');
-      const displayName = info?.displayName ?? name;
+      const displayName = escapeHtml(info?.displayName ?? name);
+      const safeName = escapeHtml(name);
 
       const sessionPct = usage ? usage.five_hour.utilization : null;
       const weeklyPct = usage ? usage.seven_day.utilization : null;
@@ -501,7 +1158,7 @@ function buildUsageHtml(
       return `<div class="card">
         <div class="card-header">
           <div>
-            <span class="account-name">${name}</span>
+            <span class="account-name">${safeName}</span>
             <span class="badge">${plan}</span>
           </div>
           <div class="account-email">${email}</div>
@@ -528,9 +1185,76 @@ function buildUsageHtml(
     color: var(--vscode-foreground);
     background: var(--vscode-editor-background);
     padding: 20px;
-    max-width: 480px;
+    max-width: 1180px;
   }
   h2 { margin-bottom: 16px; font-size: 1em; font-weight: 600; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; }
+  .section-block { margin-bottom: 22px; }
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .metric-card {
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    background: var(--vscode-editorWidget-background, transparent);
+  }
+  .metric-label { font-size: 0.78em; color: var(--vscode-descriptionForeground); margin-bottom: 5px; }
+  .metric-value { font-size: 1.15em; font-weight: 700; }
+  .stats-meta, .note {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.8em;
+    margin-top: 8px;
+  }
+  .heatmap {
+    display: grid;
+    grid-template-rows: repeat(7, 16px);
+    gap: 4px;
+    align-items: center;
+  }
+  .heat-cell {
+    width: 16px;
+    height: 16px;
+    border-radius: 2px;
+    border: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-editorWidget-background, rgba(127,127,127,0.08));
+  }
+  .heat-layout { display: flex; gap: 8px; align-items: flex-start; }
+  .heatmap-wrap { overflow-x: auto; padding-bottom: 6px; max-width: 100%; }
+  .heat-axis-x {
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.8em;
+    margin-bottom: 8px;
+  }
+  .heat-axis-y {
+    display: grid;
+    grid-template-rows: repeat(7, 16px);
+    gap: 4px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.75em;
+    line-height: 16px;
+    text-align: right;
+    min-width: 16px;
+  }
+  .heat-1 { background: color-mix(in srgb, var(--vscode-charts-green) 28%, transparent); }
+  .heat-2 { background: color-mix(in srgb, var(--vscode-charts-green) 48%, transparent); }
+  .heat-3 { background: color-mix(in srgb, var(--vscode-charts-green) 70%, transparent); }
+  .heat-4 { background: var(--vscode-charts-green); }
+  .heat-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.78em;
+  }
+  .heat-legend {
+    display: inline-flex;
+    gap: 5px;
+    align-items: center;
+  }
   .card {
     border: 1px solid var(--vscode-panel-border);
     border-radius: 6px;
@@ -561,6 +1285,36 @@ function buildUsageHtml(
   .sub { font-size: 0.75em; color: var(--vscode-descriptionForeground); margin-top: 2px; }
   .extra { font-size: 0.8em; color: var(--vscode-descriptionForeground); margin-top: 6px; }
   .dim { opacity: 0.5; }
+  .mono { font-family: var(--vscode-editor-font-family); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  th, td {
+    padding: 7px 9px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    text-align: right;
+    white-space: nowrap;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  th {
+    background: var(--vscode-editorWidget-background, rgba(127,127,127,0.08));
+    color: var(--vscode-descriptionForeground);
+    font-weight: 600;
+  }
+  tr:last-child td { border-bottom: none; }
+  .daily-total-row td {
+    background: var(--vscode-editorWidget-background, rgba(127,127,127,0.08));
+    font-weight: 600;
+  }
+  .source-day-row td:first-child { border-bottom-color: transparent; }
+  .source-day-row td:nth-child(2) {
+    color: var(--vscode-descriptionForeground);
+    padding-left: 20px;
+  }
   .refresh-btn {
     display: block;
     margin-top: 4px;
@@ -581,7 +1335,19 @@ function buildUsageHtml(
     <h2>Claude 账户使用量</h2>
     <button class="refresh-btn" onclick="refresh()">刷新</button>
   </div>
-  ${cards}
+  ${topStatsHtml}
+  <section class="section-block">
+    <h2>OAuth 额度窗口</h2>
+    ${cards || '<div class="dim">还没有保存 OAuth 账户。</div>'}
+  </section>
+  ${detailStatsHtml}
+  <section class="section-block daily-section">
+    <h2>每日统计</h2>
+    <table>
+      <thead><tr><th>日期</th><th>来源</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+      <tbody>${dailyCombinedRows || '<tr><td colspan="8" class="dim">暂无每日统计</td></tr>'}</tbody>
+    </table>
+  </section>
   <script>
     const vscode = acquireVsCodeApi();
     function refresh() { vscode.postMessage({ command: 'refresh' }); }
@@ -593,6 +1359,362 @@ function buildUsageHtml(
 // ─── 状态栏 ───────────────────────────────────────────────────────────────────
 
 let statusBar: vscode.StatusBarItem;
+let accountTreeProvider: ClaudeAccountsTreeProvider | undefined;
+let accountStatusProvider: ClaudeStatusTreeProvider | undefined;
+let autoRefreshTimer: ReturnType<typeof setInterval> | undefined;
+
+type TreeNodeKind = 'current' | 'summary' | 'section' | 'action' | 'account' | 'quota' | 'token' | 'provider' | 'empty';
+
+interface TreeNode {
+  kind: TreeNodeKind;
+  label: string;
+  section?: 'actions' | 'accounts' | 'providers';
+  accountName?: string;
+  providerName?: string;
+  commandId?: string;
+  description?: string;
+  tooltip?: string;
+  icon?: string;
+}
+
+class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
+  private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
+  private usageByAccount = new Map<string, UsageData | null>();
+  private loadingUsage = false;
+  readonly onDidChangeTreeData = this.changeEmitter.event;
+
+  refresh(forceUsage = false): void {
+    if (forceUsage) {
+      usageCache.clear();
+      this.usageByAccount.clear();
+    }
+    this.changeEmitter.fire(undefined);
+    void this.refreshUsage();
+  }
+
+  private async refreshUsage(): Promise<void> {
+    if (this.loadingUsage) { return; }
+    this.loadingUsage = true;
+    const config = loadConfig();
+    try {
+      const entries = await Promise.all(
+        config.accounts.map(async (account) => ({
+          name: account.name,
+          usage: await getUsage(account.name),
+        }))
+      );
+      this.usageByAccount.clear();
+      for (const entry of entries) {
+        this.usageByAccount.set(entry.name, entry.usage);
+      }
+      this.changeEmitter.fire(undefined);
+      accountStatusProvider?.refresh();
+    } finally {
+      this.loadingUsage = false;
+    }
+  }
+
+  getTreeItem(element: TreeNode): vscode.TreeItem {
+    const collapsible = element.kind === 'section' || element.kind === 'account'
+      ? vscode.TreeItemCollapsibleState.Expanded
+      : vscode.TreeItemCollapsibleState.None;
+    const item = new vscode.TreeItem(
+      element.label,
+      collapsible
+    );
+
+    item.description = element.description;
+
+    item.tooltip = element.tooltip ?? (element.description ? `${element.label} ${element.description}` : element.label);
+
+    if (element.kind === 'current') {
+      item.iconPath = new vscode.ThemeIcon('check');
+    } else if (element.kind === 'summary') {
+      item.iconPath = new vscode.ThemeIcon(element.icon ?? 'pulse');
+    } else if (element.kind === 'action') {
+      item.iconPath = new vscode.ThemeIcon(element.icon ?? 'circle-large-outline');
+      if (element.commandId) {
+        item.command = {
+          command: element.commandId,
+          title: element.label,
+        };
+      }
+    } else if (element.kind === 'account') {
+      item.iconPath = new vscode.ThemeIcon('account');
+      item.contextValue = 'account';
+      item.command = {
+        command: 'claude-switcher.switchToAccount',
+        title: 'Use Account',
+        arguments: [element.accountName],
+      };
+    } else if (element.kind === 'quota') {
+      item.iconPath = new vscode.ThemeIcon(element.icon ?? 'pulse');
+    } else if (element.kind === 'token') {
+      item.iconPath = new vscode.ThemeIcon(element.icon ?? 'graph-line');
+    } else if (element.kind === 'provider') {
+      item.iconPath = new vscode.ThemeIcon('server');
+      item.contextValue = 'provider';
+      item.command = {
+        command: 'claude-switcher.switchToProvider',
+        title: 'Use Provider',
+        arguments: [element.providerName],
+      };
+    } else if (element.kind === 'empty') {
+      item.iconPath = new vscode.ThemeIcon('info');
+    }
+
+    return item;
+  }
+
+  getChildren(element?: TreeNode): TreeNode[] {
+    const config = loadConfig();
+    const currentAccount = detectCurrentAccount(config);
+    const currentProvider = config.currentApiProvider;
+
+    if (!element) {
+      return [
+        { kind: 'section', label: '操作', section: 'actions' },
+        { kind: 'section', label: 'OAuth 账号', section: 'accounts' },
+        { kind: 'section', label: 'API Providers', section: 'providers' },
+      ];
+    }
+
+    if (element.kind !== 'section') {
+      if (element.kind === 'account') {
+        const usage = element.accountName ? this.usageByAccount.get(element.accountName) : undefined;
+        const localStats = getLocalTokenStats();
+        const todayKey = formatLocalDate(new Date());
+        const todayAccountStats = element.accountName
+          ? getSourceDayTotals(localStats, 'account', element.accountName, todayKey)
+          : undefined;
+        const tokenNodes: TreeNode[] = [
+          {
+            kind: 'token',
+            label: `Today    ${formatTotalsInline(todayAccountStats)}`,
+            description: '',
+            tooltip: todayAccountStats
+              ? [
+                  `今日总 Token: ${formatCompactNumber(totalTokens(todayAccountStats))}`,
+                  `今日估算费用: ${formatUsd(todayAccountStats.cost)}`,
+                ].join('\n')
+              : '今日暂无已归因到账户的本地用量',
+            icon: 'graph-line',
+          },
+          {
+            kind: 'token',
+            label: `I/O      in ${formatTokenShort(todayAccountStats?.input ?? 0)} · out ${formatTokenShort(todayAccountStats?.output ?? 0)}`,
+            tooltip: [
+              `输入: ${formatCompactNumber(todayAccountStats?.input ?? 0)}`,
+              `输出: ${formatCompactNumber(todayAccountStats?.output ?? 0)}`,
+            ].join('\n'),
+            icon: 'arrow-swap',
+          },
+          {
+            kind: 'token',
+            label: `Cache    write ${formatTokenShort(todayAccountStats?.cacheCreate ?? 0)} · read ${formatTokenShort(todayAccountStats?.cacheRead ?? 0)}`,
+            tooltip: [
+              `缓存写入: ${formatCompactNumber(todayAccountStats?.cacheCreate ?? 0)}`,
+              `缓存读取: ${formatCompactNumber(todayAccountStats?.cacheRead ?? 0)}`,
+            ].join('\n'),
+            icon: 'database',
+          },
+        ];
+        if (!usage) {
+          return [
+            {
+              kind: 'quota',
+              label: this.loadingUsage ? 'Session  读取中...' : 'Session  未读取',
+              description: this.loadingUsage ? '' : '刷新重试',
+              icon: 'dash',
+            },
+            {
+              kind: 'quota',
+              label: this.loadingUsage ? 'Weekly   读取中...' : 'Weekly   未读取',
+              description: this.loadingUsage ? '' : '刷新重试',
+              icon: 'dash',
+            },
+            ...tokenNodes,
+          ];
+        }
+        return [
+          this.buildQuotaNode('Session', usage.five_hour),
+          this.buildQuotaNode('Weekly', usage.seven_day),
+          ...tokenNodes,
+        ];
+      }
+      return [];
+    }
+
+    if (element.section === 'actions') {
+      return [
+        {
+          kind: 'action',
+          label: '添加 OAuth 账号',
+          description: '官方账号',
+          commandId: 'claude-switcher.add',
+          icon: 'add',
+        },
+        {
+          kind: 'action',
+          label: '添加 API Provider',
+          description: 'Anthropic 兼容端点',
+          commandId: 'claude-switcher.addProvider',
+          icon: 'server-process',
+        },
+        {
+          kind: 'action',
+          label: '打开用量统计',
+          description: '全局面板',
+          commandId: 'claude-switcher.usage',
+          icon: 'graph',
+        },
+      ];
+    }
+
+    if (element.section === 'accounts') {
+      if (config.accounts.length === 0) {
+        return [{ kind: 'empty', label: '还没有保存账号，点击上方添加。' }];
+      }
+      return config.accounts.map((account) => {
+        const info = readAccountInfo(account.name);
+        const usage = this.usageByAccount.get(account.name);
+        const isCurrent = account.name === currentAccount && !currentProvider;
+        const label = `${isCurrent ? '✓ ' : ''}${account.name}`;
+        const plan = info?.plan === 'pro' ? 'Pro' : (info?.plan ?? '');
+        const description = [plan, info?.email || account.description].filter(Boolean).join(' · ');
+        const tooltipParts = [
+          info?.email || account.description || account.name,
+          plan ? `计划: ${plan}` : '',
+          info?.organization ? `额度层级/组织: ${info.organization}` : '',
+          usage ? `5 小时额度: ${Math.round(usage.five_hour.utilization)}% (${formatResetTime(usage.five_hour.resets_at) || '重置时间未知'})` : '',
+          usage ? `7 天额度: ${Math.round(usage.seven_day.utilization)}% (${formatResetTime(usage.seven_day.resets_at) || '重置时间未知'})` : '',
+        ].filter(Boolean).join('\n');
+        return { kind: 'account', label, accountName: account.name, description, tooltip: tooltipParts };
+      });
+    }
+
+    if (element.section === 'providers') {
+      const providers = config.apiProviders ?? [];
+      if (providers.length === 0) {
+        return [{ kind: 'empty', label: '没有 API Provider。' }];
+      }
+      return providers.map((provider) => {
+        const isCurrent = provider.name === currentProvider;
+        const label = `${isCurrent ? '✓ ' : ''}${provider.name}`;
+        const description = [provider.model, provider.baseUrl].filter(Boolean).join(' · ');
+        return { kind: 'provider', label, providerName: provider.name, description };
+      });
+    }
+
+    return [];
+  }
+
+  private buildQuotaNode(label: string, window: UsageWindow): TreeNode {
+    const pctValue = Math.round(window.utilization);
+    const bar = this.renderUsageBar(pctValue);
+    const reset = formatResetTime(window.resets_at);
+    return {
+      kind: 'quota',
+      label: `${label.padEnd(7)} ${bar} ${pctValue}%`,
+      description: reset ? `重置 ${reset}` : '',
+      tooltip: [
+        `${label} 已用: ${pctValue}%`,
+        reset ? `重置: ${reset}` : '重置时间未知',
+      ].join('\n'),
+      icon: pctValue >= 95 ? 'warning' : (pctValue >= 70 ? 'flame' : 'pulse'),
+    };
+  }
+
+  private renderUsageBar(percent: number): string {
+    const total = 10;
+    const filled = Math.max(0, Math.min(total, Math.round((percent / 100) * total)));
+    return `${'█'.repeat(filled)}${'░'.repeat(total - filled)}`;
+  }
+}
+
+function getStatusTreeNodes(): TreeNode[] {
+  const config = loadConfig();
+  const currentAccount = detectCurrentAccount(config);
+  const currentProvider = config.currentApiProvider;
+  const localStats = getLocalTokenStats();
+  const todayKey = formatLocalDate(new Date());
+  const todayStats = localStats.byDay.find((row) => row.date === todayKey);
+  const todayTopModel = localStats.byDayModel
+    .filter((row) => row.date === todayKey)
+    .sort((a, b) => b.cost - a.cost || b.output - a.output)[0];
+  const currentLabel = currentProvider
+    ? `当前 Provider: ${currentProvider}`
+    : `当前账号: ${currentAccount ?? 'default'}`;
+  const currentDescription = currentProvider
+    ? config.apiProviders?.find((p) => p.name === currentProvider)?.baseUrl
+    : [
+        currentAccount ? readAccountInfo(currentAccount)?.email : undefined,
+      ].filter(Boolean).join(' · ');
+
+  return [
+    {
+      kind: 'current',
+      label: currentLabel,
+      description: currentDescription,
+    },
+    {
+      kind: 'summary',
+      label: '今日用量',
+      description: `${formatCompactNumber(todayStats?.output ?? 0)} out · ${formatCompactNumber(todayStats?.input ?? 0)} in · ${formatUsd(todayStats?.cost ?? 0)}`,
+      tooltip: [
+        `今日输入: ${formatCompactNumber(todayStats?.input ?? 0)}`,
+        `今日输出: ${formatCompactNumber(todayStats?.output ?? 0)}`,
+        `今日缓存写入: ${formatCompactNumber(todayStats?.cacheCreate ?? 0)}`,
+        `今日缓存读取: ${formatCompactNumber(todayStats?.cacheRead ?? 0)}`,
+        `今日估算费用: ${formatUsd(todayStats?.cost ?? 0)}`,
+      ].join('\n'),
+      icon: 'graph',
+    },
+    {
+      kind: 'summary',
+      label: todayTopModel ? '今日主要模型' : '今日模型用量',
+      description: todayTopModel
+        ? `${todayTopModel.model} · ${formatCompactNumber(todayTopModel.output)} out · ${formatUsd(todayTopModel.cost)}`
+        : '',
+      tooltip: todayTopModel
+        ? [
+            `今日模型: ${todayTopModel.model}`,
+            `今日输入: ${formatCompactNumber(todayTopModel.input)}`,
+            `今日输出: ${formatCompactNumber(todayTopModel.output)}`,
+            `今日缓存写入: ${formatCompactNumber(todayTopModel.cacheCreate)}`,
+            `今日缓存读取: ${formatCompactNumber(todayTopModel.cacheRead)}`,
+            `今日估算费用: ${formatUsd(todayTopModel.cost)}`,
+          ].join('\n')
+        : '今日暂无本地模型用量记录',
+      icon: 'symbol-method',
+    },
+  ];
+}
+
+class ClaudeStatusTreeProvider implements vscode.TreeDataProvider<TreeNode> {
+  private readonly changeEmitter = new vscode.EventEmitter<TreeNode | undefined>();
+  readonly onDidChangeTreeData = this.changeEmitter.event;
+
+  refresh(): void {
+    this.changeEmitter.fire(undefined);
+  }
+
+  getTreeItem(element: TreeNode): vscode.TreeItem {
+    const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
+    item.description = element.description;
+    item.tooltip = element.tooltip ?? (element.description ? `${element.label} ${element.description}` : element.label);
+    if (element.kind === 'current') {
+      item.iconPath = new vscode.ThemeIcon('check');
+    } else {
+      item.iconPath = new vscode.ThemeIcon(element.icon ?? 'pulse');
+    }
+    return item;
+  }
+
+  getChildren(): TreeNode[] {
+    return getStatusTreeNodes();
+  }
+}
 
 function refreshStatusBar(): void {
   const config = loadConfig();
@@ -604,6 +1726,8 @@ function refreshStatusBar(): void {
       statusBar.text = `$(server) ${provider.name}`;
       statusBar.tooltip = `当前 API Provider: ${provider.name}\n${provider.baseUrl}\n点击切换`;
       statusBar.show();
+      accountTreeProvider?.refresh();
+      accountStatusProvider?.refresh();
       return;
     }
   }
@@ -615,6 +1739,20 @@ function refreshStatusBar(): void {
   statusBar.text = `$(account) ${current ?? 'default'}`;
   statusBar.tooltip = `当前 Claude 账户: ${current ?? 'default'}${emailHint}\n点击切换`;
   statusBar.show();
+  accountTreeProvider?.refresh();
+  accountStatusProvider?.refresh();
+}
+
+function refreshManagerData(forceUsage = false): void {
+  if (forceUsage) {
+    usageCache.clear();
+    localStatsCache = undefined;
+  }
+  accountTreeProvider?.refresh(forceUsage);
+  accountStatusProvider?.refresh();
+  if (usagePanel) {
+    void updateUsagePanel(loadConfig());
+  }
 }
 
 // ─── Quick Pick 条目 ──────────────────────────────────────────────────────────
@@ -737,17 +1875,12 @@ let usagePanel: vscode.WebviewPanel | undefined;
 
 async function commandUsage(): Promise<void> {
   const config = loadConfig();
-  if (config.accounts.length === 0) {
-    vscode.window.showInformationMessage('还没有保存任何账户');
-    return;
-  }
-
   if (usagePanel) {
     usagePanel.reveal();
   } else {
     usagePanel = vscode.window.createWebviewPanel(
       'claudeUsage',
-      'Claude 账户使用量',
+      'CC Manager 全局统计',
       vscode.ViewColumn.Beside,
       { enableScripts: true }
     );
@@ -757,6 +1890,7 @@ async function commandUsage(): Promise<void> {
     usagePanel.webview.onDidReceiveMessage(async (msg) => {
       if (msg.command === 'refresh') {
         usageCache.clear();
+        localStatsCache = undefined;
         await updateUsagePanel(config);
       }
     });
@@ -776,7 +1910,8 @@ async function updateUsagePanel(config: Config): Promise<void> {
       name: a.name,
       info: readAccountInfo(a.name),
       usage: null,
-    }))
+    })),
+    getLocalTokenStats()
   );
 
   // 并发拉取所有账户使用量
@@ -789,7 +1924,70 @@ async function updateUsagePanel(config: Config): Promise<void> {
   );
 
   if (usagePanel) {
-    usagePanel.webview.html = buildUsageHtml(results);
+    usagePanel.webview.html = buildUsageHtml(results, getLocalTokenStats());
+  }
+}
+
+function resolveAccountName(arg: unknown): string | undefined {
+  if (typeof arg === 'string') { return arg; }
+  if (arg && typeof arg === 'object') {
+    const node = arg as Partial<TreeNode> & { label?: unknown };
+    if (typeof node.accountName === 'string') { return node.accountName; }
+    if (typeof node.label === 'string') { return node.label.replace(/^✓\s*/, ''); }
+  }
+  return undefined;
+}
+
+function resolveProviderName(arg: unknown): string | undefined {
+  if (typeof arg === 'string') { return arg; }
+  if (arg && typeof arg === 'object') {
+    const node = arg as Partial<TreeNode> & { label?: unknown };
+    if (typeof node.providerName === 'string') { return node.providerName; }
+    if (typeof node.label === 'string') { return node.label.replace(/^✓\s*/, ''); }
+  }
+  return undefined;
+}
+
+async function commandSwitchToAccount(arg?: unknown): Promise<void> {
+  const name = resolveAccountName(arg);
+  if (!name) { return; }
+  const config = loadConfig();
+  const currentAccount = detectCurrentAccount(config);
+  if (name === currentAccount && !config.currentApiProvider) { return; }
+
+  try {
+    await switchToAccount(name);
+    refreshStatusBar();
+    vscode.window.showInformationMessage(`已切换到账号 "${name}"，重载窗口后生效`, '立即重载')
+      .then(async (action) => {
+        if (action === '立即重载') {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`切换失败: ${message}`);
+  }
+}
+
+async function commandSwitchToProvider(arg?: unknown): Promise<void> {
+  const name = resolveProviderName(arg);
+  if (!name) { return; }
+  const config = loadConfig();
+  if (name === config.currentApiProvider) { return; }
+
+  try {
+    switchToApiProvider(name);
+    refreshStatusBar();
+    vscode.window.showInformationMessage(`已切换到 Provider "${name}"，重载窗口后生效`, '立即重载')
+      .then(async (action) => {
+        if (action === '立即重载') {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        }
+      });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`切换失败: ${message}`);
   }
 }
 
@@ -818,6 +2016,7 @@ async function commandAdd(): Promise<void> {
 async function saveCurrentSession(): Promise<void> {
   const config = loadConfig();
   let autoName = '';
+  let profile: OAuthProfile | null = null;
   try {
     const claudeJsonPath = path.join(CLAUDE_DIR, '.claude.json');
     if (fs.existsSync(claudeJsonPath)) {
@@ -825,6 +2024,17 @@ async function saveCurrentSession(): Promise<void> {
       const email = claudeJson?.oauthAccount?.emailAddress ?? '';
       if (email) {
         autoName = generateAccountName(email, config.accounts);
+      }
+    }
+    if (!autoName && fs.existsSync(CLAUDE_CREDS)) {
+      const creds = JSON.parse(fs.readFileSync(CLAUDE_CREDS, 'utf-8')) as Credentials;
+      const accessToken = creds?.claudeAiOauth?.accessToken;
+      if (accessToken) {
+        profile = await fetchOAuthProfile(accessToken);
+        const email = profile?.account?.email ?? '';
+        if (email) {
+          autoName = generateAccountName(email, config.accounts);
+        }
       }
     }
   } catch {}
@@ -850,6 +2060,21 @@ async function saveCurrentSession(): Promise<void> {
   const claudeJsonSrc = path.join(CLAUDE_DIR, '.claude.json');
   if (fs.existsSync(claudeJsonSrc)) {
     fs.copyFileSync(claudeJsonSrc, path.join(accountDir, '.claude.json'));
+  } else if (profile) {
+    fs.writeFileSync(
+      path.join(accountDir, '.claude.json'),
+      JSON.stringify(profileToClaudeJson(profile), null, 2),
+      'utf-8'
+    );
+  }
+
+  if (profile) {
+    updateCredentialsPlanFromProfile(path.join(accountDir, '.credentials.json'), profile);
+  } else {
+    await cacheProfileForCredentials(
+      path.join(accountDir, '.credentials.json'),
+      path.join(accountDir, '.claude.json')
+    );
   }
 
   const info = readAccountInfo(name);
@@ -887,20 +2112,27 @@ async function loginNewAccount(): Promise<void> {
     if (fs.existsSync(credPath)) {
       clearInterval(poll);
       let autoName = '';
+      const profile = await cacheProfileForCredentials(credPath, claudeJsonPath);
+      const profileEmail = profile?.account?.email ?? '';
+      if (profileEmail) {
+        autoName = generateAccountName(profileEmail, loadConfig().accounts);
+      }
 
       // .claude.json 可能在 credentials 出现后数秒才写入，等待最多 5 秒
-      await new Promise<void>((resolve) => {
-        let waited = 0;
-        const waitForClaudeJson = setInterval(() => {
-          waited += 500;
-          if (fs.existsSync(claudeJsonPath) || waited >= 5000) {
-            clearInterval(waitForClaudeJson);
-            resolve();
-          }
-        }, 500);
-      });
+      if (!fs.existsSync(claudeJsonPath)) {
+        await new Promise<void>((resolve) => {
+          let waited = 0;
+          const waitForClaudeJson = setInterval(() => {
+            waited += 500;
+            if (fs.existsSync(claudeJsonPath) || waited >= 5000) {
+              clearInterval(waitForClaudeJson);
+              resolve();
+            }
+          }, 500);
+        });
+      }
 
-      if (fs.existsSync(claudeJsonPath)) {
+      if (!autoName && fs.existsSync(claudeJsonPath)) {
         try {
           const claudeJson = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf-8')) as ClaudeJson;
           const email = claudeJson?.oauthAccount?.emailAddress ?? '';
@@ -986,6 +2218,138 @@ async function commandRemove(): Promise<void> {
 
   vscode.window.showInformationMessage(`账户 ${label} 已删除`);
   refreshStatusBar();
+}
+
+async function commandRemoveAccountNode(arg?: unknown): Promise<void> {
+  const accountName = resolveAccountName(arg);
+  if (!accountName) {
+    await commandRemove();
+    return;
+  }
+
+  const config = loadConfig();
+  const account = config.accounts.find((a) => a.name === accountName);
+  if (!account) {
+    vscode.window.showWarningMessage(`账号 "${accountName}" 不存在`);
+    return;
+  }
+
+  const info = readAccountInfo(accountName);
+  const label = info?.email
+    ? `"${accountName}" (${info.email})`
+    : `"${accountName}"`;
+  const confirm = await vscode.window.showWarningMessage(
+    `确定删除账户 ${label}？此操作不可撤销。`,
+    { modal: true },
+    '删除'
+  );
+  if (confirm !== '删除') {
+    return;
+  }
+
+  config.accounts = config.accounts.filter((a) => a.name !== accountName);
+  if (config.currentAccount === accountName) {
+    config.currentAccount = undefined;
+  }
+  saveConfig(config);
+
+  const accountDir = getAccountDir(accountName);
+  if (fs.existsSync(accountDir)) {
+    fs.rmSync(accountDir, { recursive: true, force: true });
+  }
+  usageCache.delete(accountName);
+
+  vscode.window.showInformationMessage(`账户 ${label} 已删除`);
+  refreshStatusBar();
+}
+
+async function commandRenameAccountNode(arg?: unknown): Promise<void> {
+  const oldName = resolveAccountName(arg);
+  const config = loadConfig();
+  const account = oldName
+    ? config.accounts.find((a) => a.name === oldName)
+    : undefined;
+
+  let sourceName = oldName;
+  if (!sourceName || !account) {
+    if (config.accounts.length === 0) {
+      vscode.window.showInformationMessage('没有可重命名的账户');
+      return;
+    }
+    const current = detectCurrentAccount(config);
+    const selected = await vscode.window.showQuickPick(
+      buildAccountQuickPickItems(config, current),
+      { placeHolder: '选择要重命名的账户' }
+    );
+    if (!selected) { return; }
+    sourceName = selected.accountName;
+  }
+
+  const sourceAccount = config.accounts.find((a) => a.name === sourceName);
+  if (!sourceAccount) {
+    vscode.window.showWarningMessage(`账号 "${sourceName}" 不存在`);
+    return;
+  }
+
+  const newName = await vscode.window.showInputBox({
+    prompt: `将账户 "${sourceName}" 重命名为`,
+    value: sourceName,
+    validateInput: (v) => {
+      const value = v?.trim();
+      if (!value) { return '名称不能为空'; }
+      if (!/^[\w-]+$/.test(value)) { return '只能包含字母、数字、- 和 _'; }
+      if (value === sourceName) { return null; }
+      if (config.accounts.find((a) => a.name === value)) { return '该名称已存在'; }
+      if (fs.existsSync(getAccountDir(value))) { return '该账户目录已存在'; }
+      return null;
+    },
+  });
+  const targetName = newName?.trim();
+  if (!targetName || targetName === sourceName) {
+    return;
+  }
+
+  const oldDir = getAccountDir(sourceName);
+  const newDir = getAccountDir(targetName);
+  if (!fs.existsSync(oldDir)) {
+    vscode.window.showErrorMessage(`账户目录不存在: ${oldDir}`);
+    return;
+  }
+  if (fs.existsSync(newDir)) {
+    vscode.window.showErrorMessage(`目标账户目录已存在: ${newDir}`);
+    return;
+  }
+
+  try {
+    fs.renameSync(oldDir, newDir);
+    sourceAccount.name = targetName;
+    if (sourceAccount.description === sourceName) {
+      sourceAccount.description = targetName;
+    }
+    if (config.currentAccount === sourceName) {
+      config.currentAccount = targetName;
+    }
+    if (config.usageAttributionHistory) {
+      for (const event of config.usageAttributionHistory) {
+        if (event.sourceType === 'account' && event.sourceName === sourceName) {
+          event.sourceName = targetName;
+        }
+      }
+    }
+    saveConfig(config);
+    const cachedUsage = usageCache.get(sourceName);
+    usageCache.delete(sourceName);
+    if (cachedUsage) {
+      usageCache.set(targetName, cachedUsage);
+    }
+    localStatsCache = undefined;
+    vscode.window.showInformationMessage(`账户已重命名: "${sourceName}" -> "${targetName}"`);
+    refreshManagerData(true);
+    refreshStatusBar();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`重命名失败: ${message}`);
+  }
 }
 
 // ─── 命令：当前账户详情 ───────────────────────────────────────────────────────
@@ -1127,6 +2491,7 @@ async function commandAddApiProvider(): Promise<void> {
   saveConfig(config);
 
   vscode.window.showInformationMessage(`API Provider "${name}" 已添加`);
+  accountTreeProvider?.refresh();
 }
 
 // ─── 命令：切换到 API Provider ─────────────────────────────────────────────────
@@ -1213,10 +2578,39 @@ async function commandRemoveApiProvider(): Promise<void> {
 // ─── 扩展入口 ─────────────────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext): void {
+  ensureCurrentUsageAttribution();
+
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'claude-switcher.switch';
   context.subscriptions.push(statusBar);
+
+  accountTreeProvider = new ClaudeAccountsTreeProvider();
+  accountStatusProvider = new ClaudeStatusTreeProvider();
+  context.subscriptions.push(
+    vscode.window.createTreeView('claude-switcher.accountsView', {
+      treeDataProvider: accountTreeProvider,
+      showCollapseAll: false,
+    }),
+    vscode.window.createTreeView('claude-switcher.statusView', {
+      treeDataProvider: accountStatusProvider,
+      showCollapseAll: false,
+    })
+  );
+  accountTreeProvider.refresh();
+  accountStatusProvider.refresh();
+
   refreshStatusBar();
+  autoRefreshTimer = setInterval(() => {
+    refreshManagerData(true);
+  }, AUTO_REFRESH_INTERVAL_MS);
+  context.subscriptions.push({
+    dispose: () => {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = undefined;
+      }
+    },
+  });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claude-switcher.switch', commandSwitch),
@@ -1226,11 +2620,23 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claude-switcher.usage', commandUsage),
     vscode.commands.registerCommand('claude-switcher.addProvider', commandAddApiProvider),
     vscode.commands.registerCommand('claude-switcher.switchProvider', commandSwitchApiProvider),
-    vscode.commands.registerCommand('claude-switcher.removeProvider', commandRemoveApiProvider)
+    vscode.commands.registerCommand('claude-switcher.removeProvider', commandRemoveApiProvider),
+    vscode.commands.registerCommand('claude-switcher.refresh', () => {
+      refreshManagerData(true);
+      refreshStatusBar();
+    }),
+    vscode.commands.registerCommand('claude-switcher.switchToAccount', commandSwitchToAccount),
+    vscode.commands.registerCommand('claude-switcher.switchToProvider', commandSwitchToProvider),
+    vscode.commands.registerCommand('claude-switcher.removeAccountNode', commandRemoveAccountNode),
+    vscode.commands.registerCommand('claude-switcher.renameAccountNode', commandRenameAccountNode)
   );
 }
 
 export function deactivate(): void {
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = undefined;
+  }
   statusBar?.dispose();
   usagePanel?.dispose();
 }

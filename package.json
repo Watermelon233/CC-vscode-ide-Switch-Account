@@ -1,8 +1,8 @@
 {
   "name": "claude-account-switcher",
-  "displayName": "Claude Account Switcher",
-  "description": "在多个 Claude Code 账户之间一键切换，无需重复登录",
-  "version": "0.1.0",
+  "displayName": "CC Manager",
+  "description": "管理多个 Claude Code 官方账号并查看额度与本地用量",
+  "version": "0.1.16",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -11,48 +11,130 @@
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cc-switcher",
+          "title": "CC Manager",
+          "icon": "resources/cc-switch.svg"
+        }
+      ]
+    },
+    "views": {
+      "cc-switcher": [
+        {
+          "id": "claude-switcher.accountsView",
+          "name": "Accounts",
+          "visibility": "visible"
+        },
+        {
+          "id": "claude-switcher.statusView",
+          "name": "Status",
+          "visibility": "visible"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "claude-switcher.switch",
-        "title": "Switch Claude Account/Provider",
-        "category": "Claude"
+        "title": "CC Manager: Switch Account/Provider",
+        "icon": "$(account)"
       },
       {
         "command": "claude-switcher.add",
-        "title": "Add Claude Account",
-        "category": "Claude"
+        "title": "CC Manager: Add Claude Account",
+        "icon": "$(add)"
       },
       {
         "command": "claude-switcher.remove",
-        "title": "Remove Claude Account",
-        "category": "Claude"
+        "title": "CC Manager: Remove Claude Account",
+        "icon": "$(trash)"
       },
       {
         "command": "claude-switcher.whoami",
-        "title": "Show Current Claude Account",
-        "category": "Claude"
+        "title": "CC Manager: Show Current Account",
+        "icon": "$(info)"
       },
       {
         "command": "claude-switcher.usage",
-        "title": "Show Usage Dashboard",
-        "category": "Claude"
+        "title": "CC Manager: Show Usage Dashboard",
+        "icon": "$(graph)"
       },
       {
         "command": "claude-switcher.addProvider",
-        "title": "Add API Provider",
-        "category": "Claude"
+        "title": "CC Manager: Add API Provider",
+        "icon": "$(server-process)"
       },
       {
         "command": "claude-switcher.switchProvider",
-        "title": "Switch API Provider",
-        "category": "Claude"
+        "title": "CC Manager: Switch API Provider",
+        "icon": "$(server)"
       },
       {
         "command": "claude-switcher.removeProvider",
-        "title": "Remove API Provider",
-        "category": "Claude"
+        "title": "CC Manager: Remove API Provider",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claude-switcher.refresh",
+        "title": "CC Manager: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claude-switcher.switchToAccount",
+        "title": "CC Manager: Use This Account"
+      },
+      {
+        "command": "claude-switcher.switchToProvider",
+        "title": "CC Manager: Use This Provider"
+      },
+      {
+        "command": "claude-switcher.removeAccountNode",
+        "title": "CC Manager: Delete This Account",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claude-switcher.renameAccountNode",
+        "title": "CC Manager: Rename This Account",
+        "icon": "$(edit)"
       }
-    ]
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "claude-switcher.usage",
+          "when": "view == claude-switcher.accountsView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claude-switcher.refresh",
+          "when": "view == claude-switcher.accountsView",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claude-switcher.switchToAccount",
+          "when": "view == claude-switcher.accountsView && viewItem == account",
+          "group": "inline@1"
+        },
+        {
+          "command": "claude-switcher.removeAccountNode",
+          "when": "view == claude-switcher.accountsView && viewItem == account",
+          "group": "inline@3"
+        },
+        {
+          "command": "claude-switcher.renameAccountNode",
+          "when": "view == claude-switcher.accountsView && viewItem == account",
+          "group": "inline@2"
+        },
+        {
+          "command": "claude-switcher.switchToProvider",
+          "when": "view == claude-switcher.accountsView && viewItem == provider",
+          "group": "inline@1"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",
