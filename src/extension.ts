@@ -204,9 +204,12 @@ const MODEL_PRICING: { match: RegExp; pricing: ModelPricing }[] = [
 
 const usageCache = new Map<string, { data: UsageData; fetchedAt: number }>();
 const usageErrorByAccount = new Map<string, string>();
+const usageRetryAfterByAccount = new Map<string, number>();
 let localStatsCache: { data: LocalTokenStats; fetchedAt: number } | undefined;
 const CACHE_TTL = 5 * 60 * 1000;
 const AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
+const USAGE_REQUEST_SPACING_MS = 350;
 
 // ─── 配置文件操作 ─────────────────────────────────────────────────────────────
 
@@ -317,15 +320,73 @@ function shouldRefreshToken(expiresAt: number | undefined): boolean {
   return normalizeExpiresAt(expiresAt) <= Date.now() + TOKEN_REFRESH_SKEW_MS;
 }
 
+function readCredentialsFile(credPath: string): Credentials | null {
+  try {
+    if (!fs.existsSync(credPath)) { return null; }
+    return JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+  } catch {
+    return null;
+  }
+}
+
+function readClaudeJsonEmail(filePath: string): string | undefined {
+  try {
+    if (!fs.existsSync(filePath)) { return undefined; }
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as ClaudeJson;
+    return data.oauthAccount?.emailAddress?.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+function activeSessionMatchesAccount(accountName: string): boolean {
+  const accountEmail = readClaudeJsonEmail(getAccountClaudeJsonPath(accountName));
+  const activeEmail = readClaudeJsonEmail(path.join(CLAUDE_DIR, '.claude.json'));
+  if (accountEmail && activeEmail) {
+    return accountEmail === activeEmail;
+  }
+
+  const accountRefresh = readCredentialsFile(getAccountCredPath(accountName))?.claudeAiOauth?.refreshToken;
+  const activeRefresh = readCredentialsFile(CLAUDE_CREDS)?.claudeAiOauth?.refreshToken;
+  return Boolean(accountRefresh && activeRefresh && accountRefresh === activeRefresh);
+}
+
+function syncActiveCredentialsToCurrentAccount(config = loadConfig()): void {
+  if (!config.currentAccount || config.currentApiProvider || !fs.existsSync(CLAUDE_CREDS)) {
+    return;
+  }
+  if (!activeSessionMatchesAccount(config.currentAccount)) {
+    return;
+  }
+
+  try {
+    const accountDir = getAccountDir(config.currentAccount);
+    fs.mkdirSync(accountDir, { recursive: true });
+    fs.copyFileSync(CLAUDE_CREDS, getAccountCredPath(config.currentAccount));
+    const activeClaudeJson = path.join(CLAUDE_DIR, '.claude.json');
+    if (fs.existsSync(activeClaudeJson)) {
+      fs.copyFileSync(activeClaudeJson, getAccountClaudeJsonPath(config.currentAccount));
+    }
+  } catch {}
+}
+
 // ─── 账户信息读取 ─────────────────────────────────────────────────────────────
 
 function readAccountInfo(accountName: string): AccountInfo | null {
   try {
+    const config = loadConfig();
+    if (config.currentAccount === accountName && !config.currentApiProvider) {
+      syncActiveCredentialsToCurrentAccount(config);
+    }
+
     const credPath = getAccountCredPath(accountName);
     if (!fs.existsSync(credPath)) {
       return null;
     }
-    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+    const creds = readCredentialsFile(credPath);
+    if (!creds) {
+      return null;
+    }
     let refreshToken = creds?.claudeAiOauth?.refreshToken ?? '';
     let accessToken = creds?.claudeAiOauth?.accessToken ?? '';
     const expiresAt = creds?.claudeAiOauth?.expiresAt ?? 0;
@@ -334,10 +395,9 @@ function readAccountInfo(accountName: string): AccountInfo | null {
     // Claude Code 会自动刷新活跃账户的 token，但不会同步回账户目录
     if (shouldRefreshToken(expiresAt) && fs.existsSync(CLAUDE_CREDS)) {
       try {
-        const config = loadConfig();
         if (config.currentAccount === accountName) {
           // 当前激活账户：直接使用活跃凭证（Claude Code 保持其最新）
-          const activeCreds = JSON.parse(fs.readFileSync(CLAUDE_CREDS, 'utf-8')) as Credentials;
+          const activeCreds = readCredentialsFile(CLAUDE_CREDS);
           const activeAccess = activeCreds?.claudeAiOauth?.accessToken;
           const activeRefresh = activeCreds?.claudeAiOauth?.refreshToken;
           if (activeAccess) {
@@ -376,47 +436,68 @@ function readAccountInfo(accountName: string): AccountInfo | null {
 
 async function refreshOAuthToken(accountName: string): Promise<string | null> {
   try {
+    const config = loadConfig();
+    if (config.currentAccount === accountName && !config.currentApiProvider) {
+      syncActiveCredentialsToCurrentAccount(config);
+    }
+
     const credPath = getAccountCredPath(accountName);
     if (!fs.existsSync(credPath)) { return null; }
-    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+    const creds = readCredentialsFile(credPath);
+    if (!creds) { return null; }
     const refreshToken = creds?.claudeAiOauth?.refreshToken;
     const scopes = creds?.claudeAiOauth?.scopes ?? ['user:inference', 'user:profile'];
     if (!refreshToken) { return null; }
 
-    const res = await fetch(OAUTH_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'claude-code/2.1.86' },
-      body: JSON.stringify({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: OAUTH_CLIENT_ID,
-        scope: scopes.join(' '),
-      }),
-    });
-    if (!res.ok) { return null; }
+    const activeRefresh = config.currentAccount === accountName && !config.currentApiProvider
+      ? readCredentialsFile(CLAUDE_CREDS)?.claudeAiOauth?.refreshToken
+      : undefined;
+    const refreshTokens = Array.from(new Set([refreshToken, activeRefresh].filter(Boolean) as string[]));
 
-    const json = await res.json() as {
-      access_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-    if (!json.access_token) { return null; }
+    let json: { access_token?: string; refresh_token?: string; expires_in?: number } | null = null;
+    let lastStatus: number | undefined;
+    for (const token of refreshTokens) {
+      const res = await fetch(OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'claude-code/2.1.86' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: token,
+          client_id: OAUTH_CLIENT_ID,
+          scope: scopes.join(' '),
+        }),
+      });
+      lastStatus = res.status;
+      if (!res.ok) { continue; }
+      const candidate = await res.json() as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      if (candidate.access_token) {
+        json = candidate;
+        break;
+      }
+    }
+    if (!json?.access_token) {
+      usageErrorByAccount.set(accountName, lastStatus ? `Token 刷新失败 HTTP ${lastStatus}` : 'Token 刷新失败');
+      return null;
+    }
 
     // 更新存储的凭证
     const updated: Credentials = {
       claudeAiOauth: {
         ...creds.claudeAiOauth,
         accessToken: json.access_token,
-        refreshToken: json.refresh_token ?? refreshToken,
+        refreshToken: json.refresh_token ?? refreshTokens[refreshTokens.length - 1] ?? refreshToken,
         expiresAt: json.expires_in ? Date.now() + json.expires_in * 1000 : undefined,
       },
     };
     fs.writeFileSync(credPath, JSON.stringify(updated, null, 2), 'utf-8');
 
     // 如果是当前激活账户，同步更新 ~/.claude/.credentials.json
-    const config = loadConfig();
     if (config.currentAccount === accountName) {
-      const active = JSON.parse(fs.readFileSync(CLAUDE_CREDS, 'utf-8')) as Credentials;
+      const active = readCredentialsFile(CLAUDE_CREDS) ?? {};
       active.claudeAiOauth = updated.claudeAiOauth;
       fs.writeFileSync(CLAUDE_CREDS, JSON.stringify(active, null, 2), 'utf-8');
     }
@@ -429,7 +510,25 @@ async function refreshOAuthToken(accountName: string): Promise<string | null> {
 
 // ─── 使用量 API ───────────────────────────────────────────────────────────────
 
-async function fetchUsage(accessToken: string): Promise<{ data: UsageData | null; error?: string }> {
+function parseRetryAfterMs(value: string | null): number | undefined {
+  if (!value) { return undefined; }
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+  const dateMs = new Date(value).getTime();
+  if (Number.isFinite(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+  return undefined;
+}
+
+function formatCooldown(ms: number): string {
+  const minutes = Math.max(1, Math.ceil(ms / 60000));
+  return `${minutes}分钟后重试`;
+}
+
+async function fetchUsage(accessToken: string): Promise<{ data: UsageData | null; error?: string; status?: number; retryAfterMs?: number }> {
   try {
     const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
       headers: {
@@ -438,7 +537,14 @@ async function fetchUsage(accessToken: string): Promise<{ data: UsageData | null
       },
     });
     if (!res.ok) {
-      return { data: null, error: `HTTP ${res.status}` };
+      return {
+        data: null,
+        error: `HTTP ${res.status}`,
+        status: res.status,
+        retryAfterMs: res.status === 429
+          ? parseRetryAfterMs(res.headers.get('retry-after')) ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS
+          : undefined,
+      };
     }
     return { data: (await res.json()) as UsageData };
   } catch (err: unknown) {
@@ -512,10 +618,23 @@ async function cacheProfileForCredentials(credPath: string, claudeJsonPath: stri
   }
 }
 
-async function getUsage(accountName: string): Promise<UsageData | null> {
+async function getUsage(accountName: string, force = false): Promise<UsageData | null> {
+  if (force) {
+    usageRetryAfterByAccount.delete(accountName);
+  }
+
   const cached = usageCache.get(accountName);
-  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) {
+  if (cached && !force && Date.now() - cached.fetchedAt < CACHE_TTL) {
     return cached.data;
+  }
+
+  const retryAfter = usageRetryAfterByAccount.get(accountName);
+  if (retryAfter && retryAfter > Date.now()) {
+    usageErrorByAccount.set(accountName, `HTTP 429，${formatCooldown(retryAfter - Date.now())}`);
+    return cached?.data ?? null;
+  }
+  if (retryAfter && retryAfter <= Date.now()) {
+    usageRetryAfterByAccount.delete(accountName);
   }
 
   const info = readAccountInfo(accountName);
@@ -528,7 +647,7 @@ async function getUsage(accountName: string): Promise<UsageData | null> {
   const credPath = getAccountCredPath(accountName);
   let accessToken = info.accessToken;
   try {
-    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+    const creds = readCredentialsFile(credPath);
     const expiresAt = creds?.claudeAiOauth?.expiresAt ?? 0;
     if (shouldRefreshToken(expiresAt)) {
       const newToken = await refreshOAuthToken(accountName);
@@ -536,14 +655,29 @@ async function getUsage(accountName: string): Promise<UsageData | null> {
     }
   } catch {}
 
-  const { data, error } = await fetchUsage(accessToken);
+  let { data, error, status, retryAfterMs } = await fetchUsage(accessToken);
+  if (!data && (status === 401 || status === 403)) {
+    const refreshedToken = await refreshOAuthToken(accountName);
+    if (refreshedToken) {
+      ({ data, error, status, retryAfterMs } = await fetchUsage(refreshedToken));
+    } else {
+      error = `${error ?? `HTTP ${status}`}，Token 刷新失败`;
+    }
+  }
   if (data) {
     usageCache.set(accountName, { data, fetchedAt: Date.now() });
     usageErrorByAccount.delete(accountName);
+    usageRetryAfterByAccount.delete(accountName);
   } else {
-    usageErrorByAccount.set(accountName, error ?? '读取失败');
+    if (retryAfterMs) {
+      usageRetryAfterByAccount.set(accountName, Date.now() + retryAfterMs);
+    }
+    usageErrorByAccount.set(
+      accountName,
+      retryAfterMs ? `${error ?? '读取失败'}，${formatCooldown(retryAfterMs)}` : error ?? '读取失败'
+    );
   }
-  return data;
+  return data ?? cached?.data ?? null;
 }
 
 // ─── 自动生成账户名 ───────────────────────────────────────────────────────────
@@ -1424,25 +1558,34 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
 
   refresh(forceUsage = false): void {
     if (forceUsage) {
-      usageCache.clear();
       usageErrorByAccount.clear();
-      this.usageByAccount.clear();
     }
     this.changeEmitter.fire(undefined);
-    void this.refreshUsage();
+    void this.refreshUsage(forceUsage);
   }
 
-  private async refreshUsage(): Promise<void> {
+  private async refreshUsage(forceUsage = false): Promise<void> {
     if (this.loadingUsage) { return; }
     this.loadingUsage = true;
     const config = loadConfig();
     try {
-      const entries = await Promise.all(
-        config.accounts.map(async (account) => ({
+      syncActiveCredentialsToCurrentAccount(config);
+      const currentAccount = detectCurrentAccount(config);
+      const accounts = [...config.accounts].sort((a, b) => {
+        if (a.name === currentAccount) { return -1; }
+        if (b.name === currentAccount) { return 1; }
+        return 0;
+      });
+      const entries: Array<{ name: string; usage: UsageData | null }> = [];
+      for (const account of accounts) {
+        entries.push({
           name: account.name,
-          usage: await getUsage(account.name),
-        }))
-      );
+          usage: await getUsage(account.name, forceUsage),
+        });
+        if (accounts.length > 1) {
+          await new Promise((resolve) => setTimeout(resolve, USAGE_REQUEST_SPACING_MS));
+        }
+      }
       this.usageByAccount.clear();
       for (const entry of entries) {
         this.usageByAccount.set(entry.name, entry.usage);
@@ -1603,9 +1746,20 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
             ...tokenNodes,
           ];
         }
+        const usageError = element.accountName ? usageErrorByAccount.get(element.accountName) : undefined;
+        const errorNodes: TreeNode[] = usageError
+          ? [{
+              kind: 'quota',
+              label: `Quota    ${usageError}`,
+              description: '保留上次成功额度',
+              tooltip: `额度刷新失败: ${usageError}\n当前显示的是上次成功读取的额度。`,
+              icon: 'warning',
+            }]
+          : [];
         return [
           this.buildQuotaNode('Session', usage.five_hour),
           this.buildQuotaNode('Weekly', usage.seven_day),
+          ...errorNodes,
           ...tokenNodes,
         ];
       }
@@ -1812,14 +1966,14 @@ function refreshStatusBar(): void {
 
 function refreshManagerData(forceUsage = false): void {
   if (forceUsage) {
-    usageCache.clear();
     usageErrorByAccount.clear();
     localStatsCache = undefined;
   }
+  syncActiveCredentialsToCurrentAccount();
   accountTreeProvider?.refresh(forceUsage);
   accountStatusProvider?.refresh();
   if (usagePanel) {
-    void updateUsagePanel(loadConfig());
+    void updateUsagePanel(loadConfig(), forceUsage);
   }
 }
 
@@ -1957,9 +2111,9 @@ async function commandUsage(): Promise<void> {
     });
     usagePanel.webview.onDidReceiveMessage(async (msg) => {
       if (msg.command === 'refresh') {
-        usageCache.clear();
+        usageErrorByAccount.clear();
         localStatsCache = undefined;
-        await updateUsagePanel(config);
+        await updateUsagePanel(loadConfig(), true);
       }
     });
   }
@@ -1967,10 +2121,11 @@ async function commandUsage(): Promise<void> {
   await updateUsagePanel(config);
 }
 
-async function updateUsagePanel(config: Config): Promise<void> {
+async function updateUsagePanel(config: Config, forceUsage = false): Promise<void> {
   if (!usagePanel) {
     return;
   }
+  syncActiveCredentialsToCurrentAccount(config);
 
   // 先展示加载中
   usagePanel.webview.html = buildUsageHtml(
@@ -1982,14 +2137,24 @@ async function updateUsagePanel(config: Config): Promise<void> {
     getLocalTokenStats()
   );
 
-  // 并发拉取所有账户使用量
-  const results = await Promise.all(
-    config.accounts.map(async (a) => ({
+  // 串行拉取，避免 usage endpoint 对同一客户端的短时间并发请求过敏。
+  const currentAccount = detectCurrentAccount(config);
+  const accounts = [...config.accounts].sort((a, b) => {
+    if (a.name === currentAccount) { return -1; }
+    if (b.name === currentAccount) { return 1; }
+    return 0;
+  });
+  const results: Array<{ name: string; info: AccountInfo | null; usage: UsageData | null }> = [];
+  for (const a of accounts) {
+    results.push({
       name: a.name,
       info: readAccountInfo(a.name),
-      usage: await getUsage(a.name),
-    }))
-  );
+      usage: await getUsage(a.name, forceUsage),
+    });
+    if (accounts.length > 1) {
+      await new Promise((resolve) => setTimeout(resolve, USAGE_REQUEST_SPACING_MS));
+    }
+  }
 
   if (usagePanel) {
     usagePanel.webview.html = buildUsageHtml(results, getLocalTokenStats());
