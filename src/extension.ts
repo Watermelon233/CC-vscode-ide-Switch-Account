@@ -36,12 +36,18 @@ interface UsageAttributionEvent {
   sourceName: string;
 }
 
+interface StoredUsageCache {
+  data: UsageData;
+  fetchedAt: number;
+}
+
 interface Config {
   accounts: Account[];
   currentAccount?: string;
   apiProviders?: ApiProvider[];
   currentApiProvider?: string;
   usageAttributionHistory?: UsageAttributionEvent[];
+  quotaUsageCache?: Record<string, StoredUsageCache>;
 }
 
 interface Credentials {
@@ -183,7 +189,10 @@ interface ClaudeTranscriptEntry {
 // ─── OAuth 常量 ───────────────────────────────────────────────────────────────
 
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const OAUTH_TOKEN_URL = 'https://claude.ai/api/oauth/token';
+const OAUTH_TOKEN_URLS = [
+  'https://api.anthropic.com/v1/oauth/token',
+  'https://claude.ai/api/oauth/token',
+];
 const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const CLAUDE_PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
@@ -233,6 +242,64 @@ function writeJsonFileAtomic(filePath: string, data: unknown): void {
   const tempPath = `${filePath}.${Date.now()}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
   fs.renameSync(tempPath, filePath);
+}
+
+function isUsageData(value: unknown): value is UsageData {
+  const usage = value as Partial<UsageData> | undefined;
+  return Boolean(
+    usage?.five_hour &&
+    typeof usage.five_hour.utilization === 'number' &&
+    usage?.seven_day &&
+    typeof usage.seven_day.utilization === 'number'
+  );
+}
+
+function getStoredUsageCache(accountName: string): StoredUsageCache | undefined {
+  const memoryCache = usageCache.get(accountName);
+  if (memoryCache) {
+    return memoryCache;
+  }
+
+  const stored = loadConfig().quotaUsageCache?.[accountName];
+  if (!stored || !Number.isFinite(stored.fetchedAt) || !isUsageData(stored.data)) {
+    return undefined;
+  }
+  usageCache.set(accountName, stored);
+  return stored;
+}
+
+function setStoredUsageCache(accountName: string, data: UsageData): void {
+  const stored = { data, fetchedAt: Date.now() };
+  usageCache.set(accountName, stored);
+  const config = loadConfig();
+  config.quotaUsageCache = config.quotaUsageCache ?? {};
+  config.quotaUsageCache[accountName] = stored;
+  saveConfig(config);
+}
+
+function getNextQuotaRefreshAt(cache: StoredUsageCache): number {
+  const resetAt = cache.data.five_hour.resets_at ? Date.parse(cache.data.five_hour.resets_at) : NaN;
+  if (Number.isFinite(resetAt) && resetAt > cache.fetchedAt) {
+    return resetAt + 60_000;
+  }
+  return cache.fetchedAt + 5 * 60 * 60 * 1000;
+}
+
+function shouldRefreshCachedQuota(cache: StoredUsageCache): boolean {
+  return Date.now() >= getNextQuotaRefreshAt(cache);
+}
+
+function formatUsageCacheTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const today = formatLocalDate(new Date());
+  const day = formatLocalDate(date);
+  return date.toLocaleString('zh-CN', {
+    month: day === today ? undefined : '2-digit',
+    day: day === today ? undefined : '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 function appendUsageAttribution(
@@ -467,7 +534,6 @@ async function refreshOAuthTokenInternal(accountName: string): Promise<string | 
     const creds = readCredentialsFile(credPath);
     if (!creds) { return null; }
     const refreshToken = creds?.claudeAiOauth?.refreshToken;
-    const scopes = creds?.claudeAiOauth?.scopes ?? ['user:inference', 'user:profile'];
     if (!refreshToken) { return null; }
 
     const activeRefresh = config.currentAccount === accountName && !config.currentApiProvider
@@ -478,25 +544,33 @@ async function refreshOAuthTokenInternal(accountName: string): Promise<string | 
     let json: { access_token?: string; refresh_token?: string; expires_in?: number } | null = null;
     let lastStatus: number | undefined;
     for (const token of refreshTokens) {
-      const res = await fetch(OAUTH_TOKEN_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': 'claude-code/2.1.86' },
-        body: JSON.stringify({
-          grant_type: 'refresh_token',
-          refresh_token: token,
-          client_id: OAUTH_CLIENT_ID,
-          scope: scopes.join(' '),
-        }),
-      });
-      lastStatus = res.status;
-      if (!res.ok) { continue; }
-      const candidate = await res.json() as {
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-      };
-      if (candidate.access_token) {
-        json = candidate;
+      for (const tokenUrl of OAUTH_TOKEN_URLS) {
+        const res = await fetch(tokenUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'claude-code/2.1.86',
+          },
+          body: JSON.stringify({
+            grant_type: 'refresh_token',
+            refresh_token: token,
+            client_id: OAUTH_CLIENT_ID,
+          }),
+        });
+        lastStatus = res.status;
+        if (!res.ok) { continue; }
+        const candidate = await res.json() as {
+          access_token?: string;
+          refresh_token?: string;
+          expires_in?: number;
+        };
+        if (candidate.access_token) {
+          json = candidate;
+          break;
+        }
+      }
+      if (json?.access_token) {
         break;
       }
     }
@@ -640,11 +714,26 @@ async function cacheProfileForCredentials(credPath: string, claudeJsonPath: stri
 }
 
 async function getUsage(accountName: string, force = false): Promise<UsageData | null> {
+  const config = loadConfig();
+  const currentAccount = detectCurrentAccount(config);
+  const isCurrentAccount = accountName === currentAccount && !config.currentApiProvider;
+  const cached = getStoredUsageCache(accountName);
+
+  if (!isCurrentAccount) {
+    if (cached && !shouldRefreshCachedQuota(cached)) {
+      usageErrorByAccount.delete(accountName);
+      return cached.data;
+    }
+    if (!cached) {
+      usageErrorByAccount.set(accountName, '无额度缓存，切换到该账号后读取');
+      return null;
+    }
+  }
+
   if (force) {
     usageRetryAfterByAccount.delete(accountName);
   }
 
-  const cached = usageCache.get(accountName);
   if (cached && !force && Date.now() - cached.fetchedAt < CACHE_TTL) {
     return cached.data;
   }
@@ -697,7 +786,7 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
     }
   }
   if (data) {
-    usageCache.set(accountName, { data, fetchedAt: Date.now() });
+    setStoredUsageCache(accountName, data);
     usageErrorByAccount.delete(accountName);
     usageRetryAfterByAccount.delete(accountName);
   } else {
@@ -1697,6 +1786,8 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     if (element.kind !== 'section') {
       if (element.kind === 'account') {
         const usage = element.accountName ? this.usageByAccount.get(element.accountName) : undefined;
+        const quotaCache = element.accountName ? getStoredUsageCache(element.accountName) : undefined;
+        const isCurrentQuotaAccount = element.accountName === currentAccount && !currentProvider;
         const localStats = getLocalTokenStats();
         const todayKey = formatLocalDate(new Date());
         const todayAccountStats = element.accountName
@@ -1779,6 +1870,9 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
           ];
         }
         const usageError = element.accountName ? usageErrorByAccount.get(element.accountName) : undefined;
+        const quotaMetaNodes = quotaCache
+          ? [this.buildQuotaCacheNode(quotaCache, isCurrentQuotaAccount)]
+          : [];
         const errorNodes: TreeNode[] = usageError
           ? [{
               kind: 'quota',
@@ -1791,6 +1885,7 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         return [
           this.buildQuotaNode('Session', usage.five_hour),
           this.buildQuotaNode('Weekly', usage.seven_day),
+          ...quotaMetaNodes,
           ...errorNodes,
           ...tokenNodes,
         ];
@@ -1875,6 +1970,22 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         reset ? `重置: ${reset}` : '重置时间未知',
       ].join('\n'),
       icon: pctValue >= 95 ? 'warning' : (pctValue >= 70 ? 'flame' : 'pulse'),
+    };
+  }
+
+  private buildQuotaCacheNode(cache: StoredUsageCache, isCurrentAccount: boolean): TreeNode {
+    const nextRefresh = getNextQuotaRefreshAt(cache);
+    return {
+      kind: 'quota',
+      label: `更新    ${formatUsageCacheTime(cache.fetchedAt)}`,
+      description: isCurrentAccount ? '当前账号实时刷新' : `下次 ${formatUsageCacheTime(nextRefresh)}`,
+      tooltip: [
+        `额度缓存更新时间: ${new Date(cache.fetchedAt).toLocaleString('zh-CN', { hour12: false })}`,
+        isCurrentAccount
+          ? '当前登录账号会按常规刷新'
+          : `非当前账号只在 5h 窗口重置后自动刷新: ${new Date(nextRefresh).toLocaleString('zh-CN', { hour12: false })}`,
+      ].join('\n'),
+      icon: 'history',
     };
   }
 
@@ -2473,6 +2584,9 @@ async function commandRemove(): Promise<void> {
   if (config.currentAccount === selected.accountName) {
     config.currentAccount = undefined;
   }
+  if (config.quotaUsageCache) {
+    delete config.quotaUsageCache[selected.accountName];
+  }
   saveConfig(config);
 
   const accountDir = getAccountDir(selected.accountName);
@@ -2480,6 +2594,7 @@ async function commandRemove(): Promise<void> {
     fs.rmSync(accountDir, { recursive: true, force: true });
   }
   usageCache.delete(selected.accountName);
+  usageRetryAfterByAccount.delete(selected.accountName);
 
   vscode.window.showInformationMessage(`账户 ${label} 已删除`);
   refreshStatusBar();
@@ -2516,6 +2631,9 @@ async function commandRemoveAccountNode(arg?: unknown): Promise<void> {
   if (config.currentAccount === accountName) {
     config.currentAccount = undefined;
   }
+  if (config.quotaUsageCache) {
+    delete config.quotaUsageCache[accountName];
+  }
   saveConfig(config);
 
   const accountDir = getAccountDir(accountName);
@@ -2523,6 +2641,7 @@ async function commandRemoveAccountNode(arg?: unknown): Promise<void> {
     fs.rmSync(accountDir, { recursive: true, force: true });
   }
   usageCache.delete(accountName);
+  usageRetryAfterByAccount.delete(accountName);
 
   vscode.window.showInformationMessage(`账户 ${label} 已删除`);
   refreshStatusBar();
@@ -2601,11 +2720,20 @@ async function commandRenameAccountNode(arg?: unknown): Promise<void> {
         }
       }
     }
+    if (config.quotaUsageCache?.[sourceName]) {
+      config.quotaUsageCache[targetName] = config.quotaUsageCache[sourceName];
+      delete config.quotaUsageCache[sourceName];
+    }
     saveConfig(config);
     const cachedUsage = usageCache.get(sourceName);
     usageCache.delete(sourceName);
     if (cachedUsage) {
       usageCache.set(targetName, cachedUsage);
+    }
+    const retryAfter = usageRetryAfterByAccount.get(sourceName);
+    usageRetryAfterByAccount.delete(sourceName);
+    if (retryAfter) {
+      usageRetryAfterByAccount.set(targetName, retryAfter);
     }
     localStatsCache = undefined;
     vscode.window.showInformationMessage(`账户已重命名: "${sourceName}" -> "${targetName}"`);
