@@ -646,14 +646,25 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
   // 检查 token 是否过期，过期则尝试刷新
   const credPath = getAccountCredPath(accountName);
   let accessToken = info.accessToken;
+  let tokenRefreshFailed = false;
   try {
     const creds = readCredentialsFile(credPath);
     const expiresAt = creds?.claudeAiOauth?.expiresAt ?? 0;
     if (shouldRefreshToken(expiresAt)) {
       const newToken = await refreshOAuthToken(accountName);
-      if (newToken) { accessToken = newToken; }
+      if (newToken) {
+        accessToken = newToken;
+      } else {
+        tokenRefreshFailed = true;
+      }
     }
   } catch {}
+
+  if (tokenRefreshFailed) {
+    const tokenError = usageErrorByAccount.get(accountName) ?? 'Token 刷新失败';
+    usageErrorByAccount.set(accountName, `${tokenError}，请切换到该账号后刷新`);
+    return cached?.data ?? null;
+  }
 
   let { data, error, status, retryAfterMs } = await fetchUsage(accessToken);
   if (!data && (status === 401 || status === 403)) {
