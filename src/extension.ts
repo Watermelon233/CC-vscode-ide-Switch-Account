@@ -138,11 +138,18 @@ interface SourceDailyTokenStats extends DailyTokenStats {
   sourceLabel: string;
 }
 
+interface SourceDayModelTokenStats extends DayModelTokenStats {
+  sourceType: UsageSourceType;
+  sourceName: string;
+  sourceLabel: string;
+}
+
 interface LocalTokenStats {
   totals: TokenTotals;
   byKind: Record<UsageSourceType, TokenTotals>;
   bySource: SourceTokenStats[];
   bySourceDay: SourceDailyTokenStats[];
+  bySourceDayModel: SourceDayModelTokenStats[];
   byModel: ModelTokenStats[];
   byDayModel: DayModelTokenStats[];
   byDay: DailyTokenStats[];
@@ -196,9 +203,10 @@ const MODEL_PRICING: { match: RegExp; pricing: ModelPricing }[] = [
 // ─── 使用量缓存（内存，5分钟 TTL）────────────────────────────────────────────
 
 const usageCache = new Map<string, { data: UsageData; fetchedAt: number }>();
+const usageErrorByAccount = new Map<string, string>();
 let localStatsCache: { data: LocalTokenStats; fetchedAt: number } | undefined;
 const CACHE_TTL = 5 * 60 * 1000;
-const AUTO_REFRESH_INTERVAL_MS = CACHE_TTL;
+const AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 
 // ─── 配置文件操作 ─────────────────────────────────────────────────────────────
 
@@ -421,7 +429,7 @@ async function refreshOAuthToken(accountName: string): Promise<string | null> {
 
 // ─── 使用量 API ───────────────────────────────────────────────────────────────
 
-async function fetchUsage(accessToken: string): Promise<UsageData | null> {
+async function fetchUsage(accessToken: string): Promise<{ data: UsageData | null; error?: string }> {
   try {
     const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
       headers: {
@@ -430,11 +438,12 @@ async function fetchUsage(accessToken: string): Promise<UsageData | null> {
       },
     });
     if (!res.ok) {
-      return null;
+      return { data: null, error: `HTTP ${res.status}` };
     }
-    return (await res.json()) as UsageData;
-  } catch {
-    return null;
+    return { data: (await res.json()) as UsageData };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { data: null, error: message };
   }
 }
 
@@ -511,6 +520,7 @@ async function getUsage(accountName: string): Promise<UsageData | null> {
 
   const info = readAccountInfo(accountName);
   if (!info?.accessToken) {
+    usageErrorByAccount.set(accountName, '缺少 access token');
     return null;
   }
 
@@ -526,9 +536,12 @@ async function getUsage(accountName: string): Promise<UsageData | null> {
     }
   } catch {}
 
-  const data = await fetchUsage(accessToken);
+  const { data, error } = await fetchUsage(accessToken);
   if (data) {
     usageCache.set(accountName, { data, fetchedAt: Date.now() });
+    usageErrorByAccount.delete(accountName);
+  } else {
+    usageErrorByAccount.set(accountName, error ?? '读取失败');
   }
   return data;
 }
@@ -836,6 +849,7 @@ function getLocalTokenStats(force = false): LocalTokenStats {
   };
   const bySource = new Map<string, SourceTokenStats>();
   const bySourceDay = new Map<string, SourceDailyTokenStats>();
+  const bySourceDayModel = new Map<string, SourceDayModelTokenStats>();
   const byModel = new Map<string, TokenTotals>();
   const byDayModel = new Map<string, DayModelTokenStats>();
   const byDay = new Map<string, TokenTotals>();
@@ -927,6 +941,18 @@ function getLocalTokenStats(force = false): LocalTokenStats {
       };
       addTotals(sourceDayTotals, delta);
       bySourceDay.set(srcDayKey, sourceDayTotals);
+
+      const srcDayModelKey = `${srcKey}:${day}:${model}`;
+      const sourceDayModelTotals = bySourceDayModel.get(srcDayModelKey) ?? {
+        sourceType: source.sourceType,
+        sourceName: source.sourceName,
+        sourceLabel: source.sourceLabel,
+        date: day,
+        model,
+        ...emptyTotals(),
+      };
+      addTotals(sourceDayModelTotals, delta);
+      bySourceDayModel.set(srcDayModelKey, sourceDayModelTotals);
     }
   }
 
@@ -937,6 +963,8 @@ function getLocalTokenStats(force = false): LocalTokenStats {
       .sort((a, b) => b.cost - a.cost || totalTokens(b) - totalTokens(a)),
     bySourceDay: Array.from(bySourceDay.values())
       .sort((a, b) => b.date.localeCompare(a.date) || a.sourceLabel.localeCompare(b.sourceLabel)),
+    bySourceDayModel: Array.from(bySourceDayModel.values())
+      .sort((a, b) => b.date.localeCompare(a.date) || a.sourceLabel.localeCompare(b.sourceLabel) || b.cost - a.cost || b.output - a.output),
     byModel: Array.from(byModel.entries())
       .map(([model, value]) => ({ model, ...value }))
       .sort((a, b) => b.cost - a.cost || b.output - a.output),
@@ -969,6 +997,16 @@ function getSourceDayTotals(stats: LocalTokenStats, sourceType: UsageSourceType,
     row.sourceName === sourceName &&
     row.date === date
   );
+}
+
+function getSourceDayTopModel(stats: LocalTokenStats, sourceType: UsageSourceType, sourceName: string, date: string): SourceDayModelTokenStats | undefined {
+  return stats.bySourceDayModel
+    .filter((row) =>
+      row.sourceType === sourceType &&
+      row.sourceName === sourceName &&
+      row.date === date
+    )
+    .sort((a, b) => b.cost - a.cost || b.output - a.output)[0];
 }
 
 function formatTotalsInline(value: TokenTotals | undefined): string {
@@ -1122,6 +1160,7 @@ function buildUsageHtml(
       const plan = info?.plan === 'pro' ? 'Claude Pro' : (info?.plan ?? '—');
       const displayName = escapeHtml(info?.displayName ?? name);
       const safeName = escapeHtml(name);
+      const usageError = usage ? '' : usageErrorByAccount.get(name);
 
       const sessionPct = usage ? usage.five_hour.utilization : null;
       const weeklyPct = usage ? usage.seven_day.utilization : null;
@@ -1152,7 +1191,7 @@ function buildUsageHtml(
         : '';
 
       const noUsage = !usage
-        ? `<div class="dim" style="margin-top:8px;font-size:0.85em">无法获取使用量数据（Token 可能已过期）</div>`
+        ? `<div class="dim" style="margin-top:8px;font-size:0.85em">无法获取使用量数据${usageError ? `：${escapeHtml(usageError)}` : '（Token 可能已过期或请求过于频繁）'}</div>`
         : '';
 
       return `<div class="card">
@@ -1386,6 +1425,7 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
   refresh(forceUsage = false): void {
     if (forceUsage) {
       usageCache.clear();
+      usageErrorByAccount.clear();
       this.usageByAccount.clear();
     }
     this.changeEmitter.fire(undefined);
@@ -1487,6 +1527,9 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         const todayAccountStats = element.accountName
           ? getSourceDayTotals(localStats, 'account', element.accountName, todayKey)
           : undefined;
+        const todayAccountModel = element.accountName
+          ? getSourceDayTopModel(localStats, 'account', element.accountName, todayKey)
+          : undefined;
         const tokenNodes: TreeNode[] = [
           {
             kind: 'token',
@@ -1518,19 +1561,43 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
             ].join('\n'),
             icon: 'database',
           },
+          {
+            kind: 'token',
+            label: todayAccountModel
+              ? `Model    ${todayAccountModel.model} · ${formatTokenShort(todayAccountModel.output)} out · ${formatUsd(todayAccountModel.cost)}`
+              : 'Model    今日暂无',
+            tooltip: todayAccountModel
+              ? [
+                  `今日模型: ${todayAccountModel.model}`,
+                  `输入: ${formatCompactNumber(todayAccountModel.input)}`,
+                  `输出: ${formatCompactNumber(todayAccountModel.output)}`,
+                  `缓存写入: ${formatCompactNumber(todayAccountModel.cacheCreate)}`,
+                  `缓存读取: ${formatCompactNumber(todayAccountModel.cacheRead)}`,
+                  `估算费用: ${formatUsd(todayAccountModel.cost)}`,
+                ].join('\n')
+              : '今日暂无已归因到账户的模型用量',
+            icon: 'symbol-method',
+          },
         ];
         if (!usage) {
+          const usageError = element.accountName ? usageErrorByAccount.get(element.accountName) : undefined;
+          const readLabel = this.loadingUsage
+            ? '读取中...'
+            : (usageError ?? '未读取');
+          const readDescription = usageError?.includes('429')
+            ? '请求过于频繁，稍后自动重试'
+            : (this.loadingUsage ? '' : '刷新重试');
           return [
             {
               kind: 'quota',
-              label: this.loadingUsage ? 'Session  读取中...' : 'Session  未读取',
-              description: this.loadingUsage ? '' : '刷新重试',
+              label: `Session  ${readLabel}`,
+              description: readDescription,
               icon: 'dash',
             },
             {
               kind: 'quota',
-              label: this.loadingUsage ? 'Weekly   读取中...' : 'Weekly   未读取',
-              description: this.loadingUsage ? '' : '刷新重试',
+              label: `Weekly   ${readLabel}`,
+              description: readDescription,
               icon: 'dash',
             },
             ...tokenNodes,
@@ -1746,6 +1813,7 @@ function refreshStatusBar(): void {
 function refreshManagerData(forceUsage = false): void {
   if (forceUsage) {
     usageCache.clear();
+    usageErrorByAccount.clear();
     localStatsCache = undefined;
   }
   accountTreeProvider?.refresh(forceUsage);
@@ -2601,7 +2669,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   refreshStatusBar();
   autoRefreshTimer = setInterval(() => {
-    refreshManagerData(true);
+    refreshManagerData(false);
   }, AUTO_REFRESH_INTERVAL_MS);
   context.subscriptions.push({
     dispose: () => {
