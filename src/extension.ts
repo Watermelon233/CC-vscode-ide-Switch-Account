@@ -57,6 +57,9 @@ interface Credentials {
     expiresAt?: number;
     subscriptionType?: string;
     rateLimitTier?: string;
+    billingType?: string;
+    subscriptionCreatedAt?: string;
+    profileFetchedAt?: number;
     scopes?: string[];
   };
 }
@@ -80,7 +83,12 @@ interface OAuthProfile {
   organization?: {
     name?: string;
     organization_type?: string;
+    billing_type?: string;
     rate_limit_tier?: string;
+    subscription_created_at?: string;
+    subscription_status?: string | null;
+    claude_code_trial_ends_at?: string | null;
+    claude_code_trial_duration_days?: number | null;
   };
 }
 
@@ -89,6 +97,8 @@ interface AccountInfo {
   displayName: string;
   organization: string;
   plan: string;
+  billingType: string;
+  subscriptionCreatedAt: string;
   refreshToken: string;
   accessToken: string;
 }
@@ -220,6 +230,7 @@ const CACHE_TTL = 5 * 60 * 1000;
 const AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
 const USAGE_REQUEST_SPACING_MS = 350;
+const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // ─── 配置文件操作 ─────────────────────────────────────────────────────────────
 
@@ -300,6 +311,36 @@ function formatUsageCacheTime(timestamp: number): string {
     minute: '2-digit',
     hour12: false,
   });
+}
+
+function formatPlanLabel(plan: string | undefined, long = false): string {
+  if (plan === 'pro') { return long ? 'Claude Pro' : 'Pro'; }
+  if (plan === 'max') { return long ? 'Claude Max' : 'Max'; }
+  return plan || '';
+}
+
+function formatBillingType(billingType: string | undefined): string {
+  if (!billingType) { return ''; }
+  return billingType
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatProfileDate(value: string | undefined, compact = false): string {
+  if (!value) { return ''; }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) { return value; }
+  const date = new Date(timestamp);
+  return compact
+    ? date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+    : date.toLocaleString('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
 }
 
 function appendUsageAttribution(
@@ -484,6 +525,8 @@ function readAccountInfo(accountName: string): AccountInfo | null {
     }
 
     const plan = creds?.claudeAiOauth?.subscriptionType ?? 'unknown';
+    const billingType = creds?.claudeAiOauth?.billingType ?? '';
+    const subscriptionCreatedAt = creds?.claudeAiOauth?.subscriptionCreatedAt ?? '';
 
     let email = '';
     let displayName = '';
@@ -501,7 +544,7 @@ function readAccountInfo(accountName: string): AccountInfo | null {
       organization = creds.claudeAiOauth.rateLimitTier;
     }
 
-    return { email, displayName, organization, plan, refreshToken, accessToken };
+    return { email, displayName, organization, plan, billingType, subscriptionCreatedAt, refreshToken, accessToken };
   } catch {
     return null;
   }
@@ -684,28 +727,62 @@ function getPlanFromProfile(profile: OAuthProfile): string {
 function updateCredentialsPlanFromProfile(credPath: string, profile: OAuthProfile): void {
   const plan = getPlanFromProfile(profile);
   const tier = profile.organization?.rate_limit_tier;
-  if (!plan && !tier) { return; }
+  const billingType = profile.organization?.billing_type;
+  const subscriptionCreatedAt = profile.organization?.subscription_created_at;
+  if (!plan && !tier && !billingType && !subscriptionCreatedAt) { return; }
   try {
-    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
-    if (!creds.claudeAiOauth) { return; }
+    const creds = readCredentialsFile(credPath);
+    if (!creds?.claudeAiOauth) { return; }
     if (plan) {
       creds.claudeAiOauth.subscriptionType = plan;
     }
     if (tier) {
       creds.claudeAiOauth.rateLimitTier = tier;
     }
-    fs.writeFileSync(credPath, JSON.stringify(creds, null, 2), 'utf-8');
+    if (billingType) {
+      creds.claudeAiOauth.billingType = billingType;
+    }
+    if (subscriptionCreatedAt) {
+      creds.claudeAiOauth.subscriptionCreatedAt = subscriptionCreatedAt;
+    }
+    creds.claudeAiOauth.profileFetchedAt = Date.now();
+    writeJsonFileAtomic(credPath, creds);
+  } catch {}
+}
+
+async function refreshAccountProfileMetadata(accountName: string, force = false): Promise<void> {
+  try {
+    const credPath = getAccountCredPath(accountName);
+    const claudeJsonPath = getAccountClaudeJsonPath(accountName);
+    const creds = readCredentialsFile(credPath);
+    if (!creds?.claudeAiOauth) { return; }
+
+    const fetchedAt = creds.claudeAiOauth.profileFetchedAt ?? 0;
+    if (!force && fetchedAt && Date.now() - fetchedAt < PROFILE_CACHE_TTL_MS) {
+      return;
+    }
+
+    let accessToken = creds.claudeAiOauth.accessToken;
+    if (shouldRefreshToken(creds.claudeAiOauth.expiresAt)) {
+      accessToken = await refreshOAuthToken(accountName) ?? undefined;
+    }
+    if (!accessToken) { return; }
+
+    const profile = await fetchOAuthProfile(accessToken);
+    if (!profile) { return; }
+    writeJsonFileAtomic(claudeJsonPath, profileToClaudeJson(profile));
+    updateCredentialsPlanFromProfile(credPath, profile);
   } catch {}
 }
 
 async function cacheProfileForCredentials(credPath: string, claudeJsonPath: string): Promise<OAuthProfile | null> {
   try {
-    const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as Credentials;
+    const creds = readCredentialsFile(credPath);
     const accessToken = creds?.claudeAiOauth?.accessToken;
     if (!accessToken) { return null; }
     const profile = await fetchOAuthProfile(accessToken);
     if (!profile) { return null; }
-    fs.writeFileSync(claudeJsonPath, JSON.stringify(profileToClaudeJson(profile), null, 2), 'utf-8');
+    writeJsonFileAtomic(claudeJsonPath, profileToClaudeJson(profile));
     updateCredentialsPlanFromProfile(credPath, profile);
     return profile;
   } catch {
@@ -1408,7 +1485,9 @@ function buildUsageHtml(
   const cards = accounts
     .map(({ name, info, usage }) => {
       const email = escapeHtml(info?.email ?? '—');
-      const plan = info?.plan === 'pro' ? 'Claude Pro' : (info?.plan ?? '—');
+      const plan = formatPlanLabel(info?.plan, true) || '—';
+      const billingType = formatBillingType(info?.billingType);
+      const subscriptionCreated = formatProfileDate(info?.subscriptionCreatedAt);
       const displayName = escapeHtml(info?.displayName ?? name);
       const safeName = escapeHtml(name);
       const usageError = usage ? '' : usageErrorByAccount.get(name);
@@ -1453,6 +1532,7 @@ function buildUsageHtml(
           </div>
           <div class="account-email">${email}</div>
           <div class="dim" style="font-size:0.82em">${displayName}</div>
+          ${subscriptionCreated ? `<div class="dim" style="font-size:0.82em">订阅创建 ${escapeHtml(subscriptionCreated)}${billingType ? ` · ${escapeHtml(billingType)}` : ''}</div>` : ''}
         </div>
         ${makeBar(sessionPct, 'Session (5hr)', sessionReset)}
         ${makeBar(weeklyPct, 'Weekly (7 day)', weeklyReset)}
@@ -1695,6 +1775,7 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
       });
       const entries: Array<{ name: string; usage: UsageData | null }> = [];
       for (const account of accounts) {
+        await refreshAccountProfileMetadata(account.name, forceUsage);
         entries.push({
           name: account.name,
           usage: await getUsage(account.name, forceUsage),
@@ -1924,11 +2005,19 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         const usage = this.usageByAccount.get(account.name);
         const isCurrent = account.name === currentAccount && !currentProvider;
         const label = `${isCurrent ? '✓ ' : ''}${account.name}`;
-        const plan = info?.plan === 'pro' ? 'Pro' : (info?.plan ?? '');
-        const description = [plan, info?.email || account.description].filter(Boolean).join(' · ');
+        const plan = formatPlanLabel(info?.plan);
+        const subscriptionDate = formatProfileDate(info?.subscriptionCreatedAt, true);
+        const billingType = formatBillingType(info?.billingType);
+        const description = [
+          plan,
+          subscriptionDate ? `订阅 ${subscriptionDate}` : '',
+          info?.email || account.description,
+        ].filter(Boolean).join(' · ');
         const tooltipParts = [
           info?.email || account.description || account.name,
           plan ? `计划: ${plan}` : '',
+          billingType ? `计费类型: ${billingType}` : '',
+          info?.subscriptionCreatedAt ? `订阅创建: ${formatProfileDate(info.subscriptionCreatedAt)}` : '',
           info?.organization ? `额度层级/组织: ${info.organization}` : '',
           usage ? `5 小时额度: ${Math.round(usage.five_hour.utilization)}% (${formatResetTime(usage.five_hour.resets_at) || '重置时间未知'})` : '',
           usage ? `7 天额度: ${Math.round(usage.seven_day.utilization)}% (${formatResetTime(usage.seven_day.resets_at) || '重置时间未知'})` : '',
@@ -2126,7 +2215,8 @@ function buildAccountQuickPickItems(
   return config.accounts.map((a) => {
     const info = readAccountInfo(a.name);
     const isCurrent = a.name === currentName;
-    const planLabel = info?.plan === 'pro' ? 'Pro' : (info?.plan ?? '?');
+    const planLabel = formatPlanLabel(info?.plan) || '?';
+    const subscriptionDate = formatProfileDate(info?.subscriptionCreatedAt, true);
     const usage = usageMap?.get(a.name);
 
     let usageSuffix = '';
@@ -2140,7 +2230,7 @@ function buildAccountQuickPickItems(
       label: (isCurrent ? '$(check) ' : '$(account) ') + a.name,
       description: info?.email ?? a.description ?? '',
       detail: info
-        ? `${planLabel}  ·  ${info.organization || info.displayName || ''}${usageSuffix}`
+        ? `${[planLabel, subscriptionDate ? `订阅 ${subscriptionDate}` : '', info.organization || info.displayName || ''].filter(Boolean).join('  ·  ')}${usageSuffix}`
         : usageSuffix,
       accountName: a.name,
     };
@@ -2188,11 +2278,12 @@ async function commandSwitch(): Promise<void> {
   for (const a of config.accounts) {
     const info = readAccountInfo(a.name);
     const isCurrent = a.name === currentAccount && !currentProvider;
-    const planLabel = info?.plan === 'pro' ? 'Pro' : (info?.plan ?? '?');
+    const planLabel = formatPlanLabel(info?.plan) || '?';
+    const subscriptionDate = formatProfileDate(info?.subscriptionCreatedAt, true);
     items.push({
       label: (isCurrent ? '$(check) ' : '$(account) ') + a.name,
       description: info?.email ?? a.description ?? '',
-      detail: `${planLabel}  ·  ${info?.organization || info?.displayName || ''}`,
+      detail: [planLabel, subscriptionDate ? `订阅 ${subscriptionDate}` : '', info?.organization || info?.displayName || ''].filter(Boolean).join('  ·  '),
       itemType: 'account',
       itemName: a.name,
     });
@@ -2285,6 +2376,7 @@ async function updateUsagePanel(config: Config, forceUsage = false): Promise<voi
   });
   const results: Array<{ name: string; info: AccountInfo | null; usage: UsageData | null }> = [];
   for (const a of accounts) {
+    await refreshAccountProfileMetadata(a.name, forceUsage);
     results.push({
       name: a.name,
       info: readAccountInfo(a.name),
@@ -2769,9 +2861,19 @@ function commandWhoami(): void {
     vscode.window.showInformationMessage(`当前账户: ${current}`);
     return;
   }
-  const planLabel = info.plan === 'pro' ? 'Claude Pro' : info.plan;
+  const planLabel = formatPlanLabel(info.plan, true) || '—';
+  const billingType = formatBillingType(info.billingType) || '—';
+  const subscriptionCreated = formatProfileDate(info.subscriptionCreatedAt) || '—';
   vscode.window.showInformationMessage(
-    [`账户名: ${current}`, `邮箱: ${info.email || '—'}`, `姓名: ${info.displayName || '—'}`, `组织: ${info.organization || '—'}`, `计划: ${planLabel}`].join('\n'),
+    [
+      `账户名: ${current}`,
+      `邮箱: ${info.email || '—'}`,
+      `姓名: ${info.displayName || '—'}`,
+      `组织: ${info.organization || '—'}`,
+      `计划: ${planLabel}`,
+      `计费类型: ${billingType}`,
+      `订阅创建: ${subscriptionCreated}`,
+    ].join('\n'),
     { modal: true },
     '确定'
   );
