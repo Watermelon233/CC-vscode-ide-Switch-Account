@@ -205,6 +205,7 @@ const MODEL_PRICING: { match: RegExp; pricing: ModelPricing }[] = [
 const usageCache = new Map<string, { data: UsageData; fetchedAt: number }>();
 const usageErrorByAccount = new Map<string, string>();
 const usageRetryAfterByAccount = new Map<string, number>();
+const tokenRefreshByAccount = new Map<string, Promise<string | null>>();
 let localStatsCache: { data: LocalTokenStats; fetchedAt: number } | undefined;
 const CACHE_TTL = 5 * 60 * 1000;
 const AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
@@ -225,6 +226,13 @@ function loadConfig(): Config {
 function saveConfig(config: Config): void {
   fs.mkdirSync(SWITCH_DIR, { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+}
+
+function writeJsonFileAtomic(filePath: string, data: unknown): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
+  fs.renameSync(tempPath, filePath);
 }
 
 function appendUsageAttribution(
@@ -435,6 +443,19 @@ function readAccountInfo(accountName: string): AccountInfo | null {
 // ─── Token 刷新 ───────────────────────────────────────────────────────────────
 
 async function refreshOAuthToken(accountName: string): Promise<string | null> {
+  const existing = tokenRefreshByAccount.get(accountName);
+  if (existing) {
+    return existing;
+  }
+
+  const refreshPromise = refreshOAuthTokenInternal(accountName).finally(() => {
+    tokenRefreshByAccount.delete(accountName);
+  });
+  tokenRefreshByAccount.set(accountName, refreshPromise);
+  return refreshPromise;
+}
+
+async function refreshOAuthTokenInternal(accountName: string): Promise<string | null> {
   try {
     const config = loadConfig();
     if (config.currentAccount === accountName && !config.currentApiProvider) {
@@ -493,13 +514,13 @@ async function refreshOAuthToken(accountName: string): Promise<string | null> {
         expiresAt: json.expires_in ? Date.now() + json.expires_in * 1000 : undefined,
       },
     };
-    fs.writeFileSync(credPath, JSON.stringify(updated, null, 2), 'utf-8');
+    writeJsonFileAtomic(credPath, updated);
 
     // 如果是当前激活账户，同步更新 ~/.claude/.credentials.json
     if (config.currentAccount === accountName) {
       const active = readCredentialsFile(CLAUDE_CREDS) ?? {};
       active.claudeAiOauth = updated.claudeAiOauth;
-      fs.writeFileSync(CLAUDE_CREDS, JSON.stringify(active, null, 2), 'utf-8');
+      writeJsonFileAtomic(CLAUDE_CREDS, active);
     }
 
     return json.access_token;
