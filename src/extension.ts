@@ -724,10 +724,6 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
       usageErrorByAccount.delete(accountName);
       return cached.data;
     }
-    if (!cached) {
-      usageErrorByAccount.set(accountName, '无额度缓存，切换到该账号后读取');
-      return null;
-    }
   }
 
   if (force) {
