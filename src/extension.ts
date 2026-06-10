@@ -207,10 +207,11 @@ const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const CLAUDE_PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 
-// USD per 1M tokens. Anthropic lists Opus 4.8 at the same standard API price
-// as Opus 4.7: $5/M input and $25/M output. Keep this table easy to update
-// when model names or pricing change.
+// USD per 1M tokens, based on Anthropic's public first-party API pricing.
+// Claude Code JSONL logs expose cache_creation_input_tokens without a cache
+// duration, so cacheCreate uses the 5-minute cache write price.
 const MODEL_PRICING: { match: RegExp; pricing: ModelPricing }[] = [
+  { match: /(?:fable|mythos)[-_\s]?5/i, pricing: { input: 10, output: 50, cacheCreate: 12.5, cacheRead: 1 } },
   { match: /opus[-_\s]?4(?:[._-]?(?:8|7|6|5))/i, pricing: { input: 5, output: 25, cacheCreate: 6.25, cacheRead: 0.5 } },
   { match: /opus[-_\s]?4(?:[._-]?1)?(?:-\d{8})?$/i, pricing: { input: 15, output: 75, cacheCreate: 18.75, cacheRead: 1.5 } },
   { match: /opus/i, pricing: { input: 5, output: 25, cacheCreate: 6.25, cacheRead: 0.5 } },
