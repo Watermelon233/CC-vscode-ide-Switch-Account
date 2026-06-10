@@ -831,13 +831,16 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
   const credPath = getAccountCredPath(accountName);
   let accessToken = info.accessToken;
   let tokenRefreshFailed = false;
+  let refreshedBeforeUsage = false;
   try {
     const creds = readCredentialsFile(credPath);
     const expiresAt = creds?.claudeAiOauth?.expiresAt ?? 0;
-    if (shouldRefreshToken(expiresAt)) {
+    const nonCurrentNeedsQuotaRefresh = !isCurrentAccount && (!cached || shouldRefreshCachedQuota(cached));
+    if (nonCurrentNeedsQuotaRefresh || (!isCurrentAccount && force) || shouldRefreshToken(expiresAt)) {
       const newToken = await refreshOAuthToken(accountName);
       if (newToken) {
         accessToken = newToken;
+        refreshedBeforeUsage = true;
       } else {
         tokenRefreshFailed = true;
       }
@@ -851,6 +854,21 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
   }
 
   let { data, error, status, retryAfterMs } = await fetchUsage(accessToken);
+  if (
+    data &&
+    !isCurrentAccount &&
+    !refreshedBeforeUsage &&
+    data.five_hour.utilization === 0 &&
+    data.seven_day.utilization === 0 &&
+    !data.five_hour.resets_at &&
+    !data.seven_day.resets_at
+  ) {
+    const refreshedToken = await refreshOAuthToken(accountName);
+    if (refreshedToken) {
+      refreshedBeforeUsage = true;
+      ({ data, error, status, retryAfterMs } = await fetchUsage(refreshedToken));
+    }
+  }
   if (!data && (status === 401 || status === 403)) {
     const refreshedToken = await refreshOAuthToken(accountName);
     if (refreshedToken) {
