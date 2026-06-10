@@ -797,7 +797,7 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
   const isCurrentAccount = accountName === currentAccount && !config.currentApiProvider;
   const cached = getStoredUsageCache(accountName);
 
-  if (!isCurrentAccount) {
+  if (!isCurrentAccount && !force) {
     if (cached && !shouldRefreshCachedQuota(cached)) {
       usageErrorByAccount.delete(accountName);
       return cached.data;
