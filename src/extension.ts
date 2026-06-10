@@ -161,6 +161,12 @@ interface SourceDayModelTokenStats extends DayModelTokenStats {
   sourceLabel: string;
 }
 
+interface SourceModelTokenStats extends ModelTokenStats {
+  sourceType: UsageSourceType;
+  sourceName: string;
+  sourceLabel: string;
+}
+
 interface LocalTokenStats {
   totals: TokenTotals;
   byKind: Record<UsageSourceType, TokenTotals>;
@@ -244,6 +250,8 @@ const TOKEN_REFRESH_MIN_COOLDOWN_MS = 5 * 1000;
 const TOKEN_REFRESH_MAX_COOLDOWN_MS = 5 * 60 * 1000;
 const USAGE_REQUEST_SPACING_MS = 350;
 const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_USAGE_STATS_DAYS = 7;
+const HISTORY_DAILY_ROW_LIMIT = 180;
 
 // ─── 配置文件操作 ─────────────────────────────────────────────────────────────
 
@@ -1446,6 +1454,144 @@ function getLocalTokenStats(force = false): LocalTokenStats {
   return data;
 }
 
+function getRecentStatsStartDate(days: number): string {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - Math.max(0, days - 1));
+  return formatLocalDate(start);
+}
+
+function buildStatsFromSourceDayModels(rows: SourceDayModelTokenStats[], baseStats: LocalTokenStats): LocalTokenStats {
+  const totals = emptyTotals();
+  const byKind: Record<UsageSourceType, TokenTotals> = {
+    account: emptyTotals(),
+    api: emptyTotals(),
+    unknown: emptyTotals(),
+  };
+  const bySource = new Map<string, SourceTokenStats>();
+  const bySourceDay = new Map<string, SourceDailyTokenStats>();
+  const bySourceDayModel = new Map<string, SourceDayModelTokenStats>();
+  const byModel = new Map<string, TokenTotals>();
+  const byDayModel = new Map<string, DayModelTokenStats>();
+  const byDay = new Map<string, TokenTotals>();
+
+  for (const row of rows) {
+    const delta: TokenTotals = {
+      input: row.input,
+      output: row.output,
+      cacheCreate: row.cacheCreate,
+      cacheRead: row.cacheRead,
+      cost: row.cost,
+      requests: row.requests,
+    };
+    addTotals(totals, delta);
+    addTotals(byKind[row.sourceType], delta);
+
+    const srcKey = sourceKey(row.sourceType, row.sourceName);
+    const sourceTotals = bySource.get(srcKey) ?? {
+      sourceType: row.sourceType,
+      sourceName: row.sourceName,
+      sourceLabel: row.sourceLabel,
+      ...emptyTotals(),
+    };
+    addTotals(sourceTotals, delta);
+    bySource.set(srcKey, sourceTotals);
+
+    const srcDayKey = `${srcKey}:${row.date}`;
+    const sourceDayTotals = bySourceDay.get(srcDayKey) ?? {
+      sourceType: row.sourceType,
+      sourceName: row.sourceName,
+      sourceLabel: row.sourceLabel,
+      date: row.date,
+      ...emptyTotals(),
+    };
+    addTotals(sourceDayTotals, delta);
+    bySourceDay.set(srcDayKey, sourceDayTotals);
+
+    const srcDayModelKey = `${srcKey}:${row.date}:${row.model}`;
+    const sourceDayModelTotals = bySourceDayModel.get(srcDayModelKey) ?? {
+      sourceType: row.sourceType,
+      sourceName: row.sourceName,
+      sourceLabel: row.sourceLabel,
+      date: row.date,
+      model: row.model,
+      ...emptyTotals(),
+    };
+    addTotals(sourceDayModelTotals, delta);
+    bySourceDayModel.set(srcDayModelKey, sourceDayModelTotals);
+
+    const modelTotals = byModel.get(row.model) ?? emptyTotals();
+    addTotals(modelTotals, delta);
+    byModel.set(row.model, modelTotals);
+
+    const dayModelKey = `${row.date}:${row.model}`;
+    const dayModelTotals = byDayModel.get(dayModelKey) ?? {
+      date: row.date,
+      model: row.model,
+      ...emptyTotals(),
+    };
+    addTotals(dayModelTotals, delta);
+    byDayModel.set(dayModelKey, dayModelTotals);
+
+    const dayTotals = byDay.get(row.date) ?? emptyTotals();
+    addTotals(dayTotals, delta);
+    byDay.set(row.date, dayTotals);
+  }
+
+  return {
+    totals,
+    byKind,
+    bySource: Array.from(bySource.values())
+      .sort((a, b) => b.cost - a.cost || totalTokens(b) - totalTokens(a)),
+    bySourceDay: Array.from(bySourceDay.values())
+      .sort((a, b) => b.date.localeCompare(a.date) || a.sourceLabel.localeCompare(b.sourceLabel)),
+    bySourceDayModel: Array.from(bySourceDayModel.values())
+      .sort((a, b) => b.date.localeCompare(a.date) || a.sourceLabel.localeCompare(b.sourceLabel) || b.cost - a.cost || b.output - a.output),
+    byModel: Array.from(byModel.entries())
+      .map(([model, value]) => ({ model, ...value }))
+      .sort((a, b) => b.cost - a.cost || b.output - a.output),
+    byDayModel: Array.from(byDayModel.values())
+      .sort((a, b) => b.date.localeCompare(a.date) || b.cost - a.cost || b.output - a.output),
+    byDay: Array.from(byDay.entries())
+      .map(([date, value]) => ({ date, ...value }))
+      .sort((a, b) => b.date.localeCompare(a.date)),
+    filesScanned: baseStats.filesScanned,
+    recordsScanned: rows.reduce((sum, row) => sum + row.requests, 0),
+    updatedAt: baseStats.updatedAt,
+  };
+}
+
+function filterLocalTokenStatsByRecentDays(stats: LocalTokenStats, days: number): LocalTokenStats {
+  const startDate = getRecentStatsStartDate(days);
+  return buildStatsFromSourceDayModels(
+    stats.bySourceDayModel.filter((row) => row.date >= startDate),
+    stats
+  );
+}
+
+function buildSourceModelStats(stats: LocalTokenStats): SourceModelTokenStats[] {
+  const bySourceModel = new Map<string, SourceModelTokenStats>();
+  for (const row of stats.bySourceDayModel) {
+    const srcKey = sourceKey(row.sourceType, row.sourceName);
+    const key = `${srcKey}:${row.model}`;
+    const totals = bySourceModel.get(key) ?? {
+      sourceType: row.sourceType,
+      sourceName: row.sourceName,
+      sourceLabel: row.sourceLabel,
+      model: row.model,
+      ...emptyTotals(),
+    };
+    addTotals(totals, row);
+    bySourceModel.set(key, totals);
+  }
+  return Array.from(bySourceModel.values())
+    .sort((a, b) =>
+      a.sourceLabel.localeCompare(b.sourceLabel) ||
+      totalTokens(b) - totalTokens(a) ||
+      b.cost - a.cost
+    );
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -1489,6 +1635,16 @@ function buildTotalsCells(value: TokenTotals): string {
   ].join('');
 }
 
+function buildShareCell(share: number): string {
+  const width = Math.max(2, Math.min(100, share));
+  return `<td>
+    <div class="share-cell">
+      <div class="share-track"><div class="share-fill" style="width:${width.toFixed(1)}%"></div></div>
+      <span>${share.toFixed(1)}%</span>
+    </div>
+  </td>`;
+}
+
 function buildHeatmapHtml(stats: LocalTokenStats, days = 182): string {
   const today = new Date();
   const values = new Map(stats.byDay.map((row) => [row.date, totalTokens(row)]));
@@ -1529,8 +1685,25 @@ function buildHeatmapHtml(stats: LocalTokenStats, days = 182): string {
   </div>`;
 }
 
-function buildDailyCombinedRows(stats: LocalTokenStats): string {
-  return stats.byDay.slice(0, 45).map((day) => {
+function buildSourceModelRows(stats: LocalTokenStats, limit = 80): string {
+  const sourceTotals = new Map(stats.bySource.map((row) => [sourceKey(row.sourceType, row.sourceName), totalTokens(row)]));
+  return buildSourceModelStats(stats).slice(0, limit).map((row) => {
+    const srcKey = sourceKey(row.sourceType, row.sourceName);
+    const sourceTotal = sourceTotals.get(srcKey) ?? 0;
+    const share = sourceTotal > 0 ? (totalTokens(row) / sourceTotal) * 100 : 0;
+    return `
+      <tr>
+        <td>${escapeHtml(row.sourceLabel)}</td>
+        <td class="mono">${escapeHtml(row.model)}</td>
+        ${buildShareCell(share)}
+        ${buildTotalsCells(row)}
+      </tr>
+    `;
+  }).join('');
+}
+
+function buildDailyCombinedRows(stats: LocalTokenStats, limit = 45): string {
+  return stats.byDay.slice(0, limit).map((day) => {
     const sources = stats.bySourceDay
       .filter((row) => row.date === day.date)
       .sort((a, b) => {
@@ -1561,43 +1734,61 @@ function buildUsageHtml(
   accounts: { name: string; info: AccountInfo | null; usage: UsageData | null }[],
   localStats?: LocalTokenStats
 ): string {
-  const tokenSummary = localStats ? `
+  const visibleStats = localStats ? filterLocalTokenStatsByRecentDays(localStats, DEFAULT_USAGE_STATS_DAYS) : undefined;
+  const recentStartDate = getRecentStatsStartDate(DEFAULT_USAGE_STATS_DAYS);
+  const tokenSummary = visibleStats ? `
     <section class="summary-grid">
-      <div class="metric-card"><div class="metric-label">累计 Token</div><div class="metric-value">${formatCompactNumber(totalTokens(localStats.totals))}</div></div>
-      <div class="metric-card"><div class="metric-label">累计费用</div><div class="metric-value">${formatUsd(localStats.totals.cost)}</div></div>
-      <div class="metric-card"><div class="metric-label">账号调用</div><div class="metric-value">${formatTotalsInline(localStats.byKind.account)}</div></div>
-      <div class="metric-card"><div class="metric-label">API 调用</div><div class="metric-value">${formatTotalsInline(localStats.byKind.api)}</div></div>
-      <div class="metric-card"><div class="metric-label">未归因</div><div class="metric-value">${formatTotalsInline(localStats.byKind.unknown)}</div></div>
-      <div class="metric-card"><div class="metric-label">请求数</div><div class="metric-value">${formatCompactNumber(localStats.totals.requests)}</div></div>
+      <div class="metric-card"><div class="metric-label">Token</div><div class="metric-value">${formatCompactNumber(totalTokens(visibleStats.totals))}</div></div>
+      <div class="metric-card"><div class="metric-label">估算费用</div><div class="metric-value">${formatUsd(visibleStats.totals.cost)}</div></div>
+      <div class="metric-card"><div class="metric-label">账号调用</div><div class="metric-value">${formatTotalsInline(visibleStats.byKind.account)}</div></div>
+      <div class="metric-card"><div class="metric-label">API 调用</div><div class="metric-value">${formatTotalsInline(visibleStats.byKind.api)}</div></div>
+      <div class="metric-card"><div class="metric-label">未归因</div><div class="metric-value">${formatTotalsInline(visibleStats.byKind.unknown)}</div></div>
+      <div class="metric-card"><div class="metric-label">请求数</div><div class="metric-value">${formatCompactNumber(visibleStats.totals.requests)}</div></div>
     </section>
-    <div class="stats-meta">扫描 ${localStats.filesScanned} 个日志文件，${localStats.recordsScanned} 条 assistant usage 记录；更新时间 ${new Date(localStats.updatedAt).toLocaleString()}</div>
+    <div class="stats-meta">默认统计 ${recentStartDate} 至今天；扫描 ${localStats?.filesScanned ?? 0} 个日志文件，${localStats?.recordsScanned ?? 0} 条 assistant usage 记录；更新时间 ${localStats ? new Date(localStats.updatedAt).toLocaleString() : ''}</div>
   ` : `<div class="dim">正在读取本地 Claude Code 用量日志...</div>`;
 
-  const sourceRows = localStats?.bySource.map((row) => `
+  const sourceRows = visibleStats?.bySource.map((row) => `
     <tr>
       <td>${escapeHtml(row.sourceLabel)}</td>
       ${buildTotalsCells(row)}
     </tr>
   `).join('') ?? '';
 
-  const modelRows = localStats?.byModel.slice(0, 20).map((row) => `
+  const sourceModelRows = visibleStats ? buildSourceModelRows(visibleStats) : '';
+
+  const modelRows = visibleStats?.byModel.slice(0, 20).map((row) => `
     <tr>
       <td class="mono">${escapeHtml(row.model)}</td>
       ${buildTotalsCells(row)}
     </tr>
   `).join('') ?? '';
 
-  const dailyCombinedRows = localStats ? buildDailyCombinedRows(localStats) : '';
+  const dailyCombinedRows = visibleStats ? buildDailyCombinedRows(visibleStats, DEFAULT_USAGE_STATS_DAYS) : '';
+  const historicalSourceRows = localStats?.bySource.map((row) => `
+    <tr>
+      <td>${escapeHtml(row.sourceLabel)}</td>
+      ${buildTotalsCells(row)}
+    </tr>
+  `).join('') ?? '';
+  const historicalSourceModelRows = localStats ? buildSourceModelRows(localStats, 160) : '';
+  const historicalModelRows = localStats?.byModel.slice(0, 80).map((row) => `
+    <tr>
+      <td class="mono">${escapeHtml(row.model)}</td>
+      ${buildTotalsCells(row)}
+    </tr>
+  `).join('') ?? '';
+  const historicalDailyCombinedRows = localStats ? buildDailyCombinedRows(localStats, HISTORY_DAILY_ROW_LIMIT) : '';
 
   const topStatsHtml = `
     <section class="section-block">
-      <h2>全局累计</h2>
+      <h2>最近 ${DEFAULT_USAGE_STATS_DAYS} 天</h2>
       ${tokenSummary}
       <div class="note">价格按内置公开 API 价格表估算，仅用于比较模型/日期消耗；订阅账号实际额度扣减不等同于 API 账单。</div>
     </section>
     <section class="section-block">
       <h2>使用热力图</h2>
-      ${localStats ? buildHeatmapHtml(localStats) : ''}
+      ${visibleStats ? buildHeatmapHtml(visibleStats, DEFAULT_USAGE_STATS_DAYS) : ''}
     </section>
   `;
 
@@ -1610,6 +1801,13 @@ function buildUsageHtml(
       </table>
     </section>
     <section class="section-block">
+      <h2>来源模型占比</h2>
+      <table>
+        <thead><tr><th>来源</th><th>模型</th><th>占比</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+        <tbody>${sourceModelRows || '<tr><td colspan="9" class="dim">暂无来源模型统计</td></tr>'}</tbody>
+      </table>
+    </section>
+    <section class="section-block">
       <h2>模型用量</h2>
       <table>
         <thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
@@ -1617,6 +1815,52 @@ function buildUsageHtml(
       </table>
     </section>
   `;
+
+  const historicalStatsHtml = localStats ? `
+    <details class="section-block history-block">
+      <summary>历史统计</summary>
+      <div class="history-body">
+        <section class="section-block">
+          <h2>全量热力图</h2>
+          ${buildHeatmapHtml(localStats)}
+        </section>
+        <section class="summary-grid">
+          <div class="metric-card"><div class="metric-label">历史 Token</div><div class="metric-value">${formatCompactNumber(totalTokens(localStats.totals))}</div></div>
+          <div class="metric-card"><div class="metric-label">历史费用</div><div class="metric-value">${formatUsd(localStats.totals.cost)}</div></div>
+          <div class="metric-card"><div class="metric-label">历史账号调用</div><div class="metric-value">${formatTotalsInline(localStats.byKind.account)}</div></div>
+          <div class="metric-card"><div class="metric-label">历史 API 调用</div><div class="metric-value">${formatTotalsInline(localStats.byKind.api)}</div></div>
+        </section>
+        <section class="section-block">
+          <h2>历史来源累计</h2>
+          <table>
+            <thead><tr><th>来源</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+            <tbody>${historicalSourceRows || '<tr><td colspan="7" class="dim">暂无历史来源统计</td></tr>'}</tbody>
+          </table>
+        </section>
+        <section class="section-block">
+          <h2>历史来源模型占比</h2>
+          <table>
+            <thead><tr><th>来源</th><th>模型</th><th>占比</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+            <tbody>${historicalSourceModelRows || '<tr><td colspan="9" class="dim">暂无历史来源模型统计</td></tr>'}</tbody>
+          </table>
+        </section>
+        <section class="section-block">
+          <h2>历史模型用量</h2>
+          <table>
+            <thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+            <tbody>${historicalModelRows || '<tr><td colspan="7" class="dim">暂无历史模型用量记录</td></tr>'}</tbody>
+          </table>
+        </section>
+        <section class="section-block daily-section">
+          <h2>历史每日统计</h2>
+          <table>
+            <thead><tr><th>日期</th><th>来源</th><th>输入</th><th>输出</th><th>缓存写入</th><th>缓存读取</th><th>请求</th><th>估算费用</th></tr></thead>
+            <tbody>${historicalDailyCombinedRows || '<tr><td colspan="8" class="dim">暂无历史每日统计</td></tr>'}</tbody>
+          </table>
+        </section>
+      </div>
+    </details>
+  ` : '';
 
   const cards = accounts
     .map(({ name, info, usage }) => {
@@ -1824,6 +2068,35 @@ function buildUsageHtml(
     color: var(--vscode-descriptionForeground);
     padding-left: 20px;
   }
+  .share-cell {
+    display: grid;
+    grid-template-columns: minmax(72px, 1fr) 46px;
+    gap: 8px;
+    align-items: center;
+    min-width: 130px;
+  }
+  .share-track {
+    height: 6px;
+    background: var(--vscode-editorWidget-background, rgba(127,127,127,0.12));
+    border: 1px solid var(--vscode-panel-border);
+  }
+  .share-fill {
+    height: 100%;
+    background: var(--vscode-charts-blue);
+  }
+  .history-block {
+    border-top: 1px solid var(--vscode-panel-border);
+    padding-top: 14px;
+  }
+  .history-block summary {
+    cursor: pointer;
+    color: var(--vscode-foreground);
+    font-weight: 600;
+    margin-bottom: 14px;
+  }
+  .history-body {
+    padding-top: 4px;
+  }
   .refresh-btn {
     display: block;
     margin-top: 4px;
@@ -1857,6 +2130,7 @@ function buildUsageHtml(
       <tbody>${dailyCombinedRows || '<tr><td colspan="8" class="dim">暂无每日统计</td></tr>'}</tbody>
     </table>
   </section>
+  ${historicalStatsHtml}
   <script>
     const vscode = acquireVsCodeApi();
     function refresh() { vscode.postMessage({ command: 'refresh' }); }
