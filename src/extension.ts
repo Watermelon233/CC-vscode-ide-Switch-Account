@@ -251,6 +251,7 @@ const TOKEN_REFRESH_MAX_COOLDOWN_MS = 5 * 60 * 1000;
 const USAGE_REQUEST_SPACING_MS = 350;
 const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_USAGE_STATS_DAYS = 7;
+const DEFAULT_HEATMAP_DAYS = 182;
 const HISTORY_DAILY_ROW_LIMIT = 180;
 
 // ─── 配置文件操作 ─────────────────────────────────────────────────────────────
@@ -1787,8 +1788,8 @@ function buildUsageHtml(
       <div class="note">价格按内置公开 API 价格表估算，仅用于比较模型/日期消耗；订阅账号实际额度扣减不等同于 API 账单。</div>
     </section>
     <section class="section-block">
-      <h2>使用热力图</h2>
-      ${visibleStats ? buildHeatmapHtml(visibleStats, DEFAULT_USAGE_STATS_DAYS) : ''}
+      <h2>最近 6 个月热力图</h2>
+      ${localStats ? buildHeatmapHtml(localStats, DEFAULT_HEATMAP_DAYS) : ''}
     </section>
   `;
 
