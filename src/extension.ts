@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
 
 // ─── 路径常量 ─────────────────────────────────────────────────────────────────
 
@@ -196,6 +197,13 @@ interface ClaudeTranscriptEntry {
   };
 }
 
+interface OAuthTokenRefreshResult {
+  accessToken: string;
+  refreshToken?: string;
+  expiresIn?: number;
+  tokenUsed: string;
+}
+
 // ─── OAuth 常量 ───────────────────────────────────────────────────────────────
 
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
@@ -204,7 +212,7 @@ const OAUTH_TOKEN_URLS = [
   'https://claude.ai/api/oauth/token',
 ];
 const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
-const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+const TOKEN_REFRESH_SKEW_MS = 4 * 60 * 60 * 1000;
 const CLAUDE_PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 
 // USD per 1M tokens, based on Anthropic's public first-party API pricing.
@@ -225,11 +233,15 @@ const MODEL_PRICING: { match: RegExp; pricing: ModelPricing }[] = [
 const usageCache = new Map<string, { data: UsageData; fetchedAt: number }>();
 const usageErrorByAccount = new Map<string, string>();
 const usageRetryAfterByAccount = new Map<string, number>();
-const tokenRefreshByAccount = new Map<string, Promise<string | null>>();
+const tokenRefreshByKey = new Map<string, Promise<OAuthTokenRefreshResult | null>>();
+const tokenRefreshErrorByKey = new Map<string, string>();
+const tokenRefreshBlockedUntilByKey = new Map<string, number>();
 let localStatsCache: { data: LocalTokenStats; fetchedAt: number } | undefined;
 const CACHE_TTL = 5 * 60 * 1000;
 const AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
+const TOKEN_REFRESH_MIN_COOLDOWN_MS = 5 * 1000;
+const TOKEN_REFRESH_MAX_COOLDOWN_MS = 5 * 60 * 1000;
 const USAGE_REQUEST_SPACING_MS = 350;
 const PROFILE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -437,6 +449,24 @@ function shouldRefreshToken(expiresAt: number | undefined): boolean {
   return normalizeExpiresAt(expiresAt) <= Date.now() + TOKEN_REFRESH_SKEW_MS;
 }
 
+function tokenRefreshKey(refreshToken: string): string {
+  return crypto.createHash('sha256').update(refreshToken).digest('hex');
+}
+
+function clampTokenRefreshCooldown(ms: number | undefined): number {
+  const value = Number.isFinite(ms) ? (ms as number) : TOKEN_REFRESH_MIN_COOLDOWN_MS;
+  return Math.min(TOKEN_REFRESH_MAX_COOLDOWN_MS, Math.max(TOKEN_REFRESH_MIN_COOLDOWN_MS, value));
+}
+
+function isEmptyQuotaWindow(data: UsageData): boolean {
+  return (
+    data.five_hour.utilization === 0 &&
+    data.seven_day.utilization === 0 &&
+    !data.five_hour.resets_at &&
+    !data.seven_day.resets_at
+  );
+}
+
 function readCredentialsFile(credPath: string): Credentials | null {
   try {
     if (!fs.existsSync(credPath)) { return null; }
@@ -554,19 +584,6 @@ function readAccountInfo(accountName: string): AccountInfo | null {
 // ─── Token 刷新 ───────────────────────────────────────────────────────────────
 
 async function refreshOAuthToken(accountName: string): Promise<string | null> {
-  const existing = tokenRefreshByAccount.get(accountName);
-  if (existing) {
-    return existing;
-  }
-
-  const refreshPromise = refreshOAuthTokenInternal(accountName).finally(() => {
-    tokenRefreshByAccount.delete(accountName);
-  });
-  tokenRefreshByAccount.set(accountName, refreshPromise);
-  return refreshPromise;
-}
-
-async function refreshOAuthTokenInternal(accountName: string): Promise<string | null> {
   try {
     const config = loadConfig();
     if (config.currentAccount === accountName && !config.currentApiProvider) {
@@ -585,66 +602,125 @@ async function refreshOAuthTokenInternal(accountName: string): Promise<string | 
       : undefined;
     const refreshTokens = Array.from(new Set([refreshToken, activeRefresh].filter(Boolean) as string[]));
 
-    let json: { access_token?: string; refresh_token?: string; expires_in?: number } | null = null;
-    let lastStatus: number | undefined;
+    let lastError = '';
     for (const token of refreshTokens) {
-      for (const tokenUrl of OAUTH_TOKEN_URLS) {
-        const res = await fetch(tokenUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'User-Agent': 'claude-code/2.1.86',
-          },
-          body: JSON.stringify({
-            grant_type: 'refresh_token',
-            refresh_token: token,
-            client_id: OAUTH_CLIENT_ID,
-          }),
+      const key = tokenRefreshKey(token);
+      const blockedUntil = tokenRefreshBlockedUntilByKey.get(key);
+      if (blockedUntil && blockedUntil > Date.now()) {
+        lastError = `Token 刷新冷却，${formatCooldown(blockedUntil - Date.now())}`;
+        continue;
+      }
+      if (blockedUntil && blockedUntil <= Date.now()) {
+        tokenRefreshBlockedUntilByKey.delete(key);
+      }
+
+      let refreshPromise = tokenRefreshByKey.get(key);
+      if (!refreshPromise) {
+        refreshPromise = refreshOAuthTokenWithRefreshToken(token).finally(() => {
+          tokenRefreshByKey.delete(key);
         });
-        lastStatus = res.status;
-        if (!res.ok) { continue; }
-        const candidate = await res.json() as {
-          access_token?: string;
-          refresh_token?: string;
-          expires_in?: number;
-        };
-        if (candidate.access_token) {
-          json = candidate;
-          break;
-        }
+        tokenRefreshByKey.set(key, refreshPromise);
       }
-      if (json?.access_token) {
-        break;
+
+      const refreshed = await refreshPromise;
+      if (refreshed?.accessToken) {
+        persistRefreshedOAuthToken(accountName, refreshed);
+        return refreshed.accessToken;
       }
-    }
-    if (!json?.access_token) {
-      usageErrorByAccount.set(accountName, lastStatus ? `Token 刷新失败 HTTP ${lastStatus}` : 'Token 刷新失败');
-      return null;
+      lastError = tokenRefreshErrorByKey.get(key) ?? 'Token 刷新失败';
     }
 
-    // 更新存储的凭证
+    usageErrorByAccount.set(accountName, lastError || 'Token 刷新失败');
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshOAuthTokenWithRefreshToken(refreshToken: string): Promise<OAuthTokenRefreshResult | null> {
+  const key = tokenRefreshKey(refreshToken);
+  const blockedUntil = tokenRefreshBlockedUntilByKey.get(key);
+  if (blockedUntil && blockedUntil > Date.now()) {
+    tokenRefreshErrorByKey.set(key, `Token 刷新冷却，${formatCooldown(blockedUntil - Date.now())}`);
+    return null;
+  }
+
+  let lastStatus: number | undefined;
+  try {
+    for (const tokenUrl of OAUTH_TOKEN_URLS) {
+      const res = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'User-Agent': 'claude-code/2.1.86',
+        },
+        body: JSON.stringify({
+          client_id: OAUTH_CLIENT_ID,
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+        }),
+      });
+      lastStatus = res.status;
+      if (res.status === 429) {
+        const cooldownMs = clampTokenRefreshCooldown(
+          parseRetryAfterMs(res.headers.get('retry-after')) ??
+          parseRetryAfterMsHeader(res.headers.get('retry-after-ms'))
+        );
+        tokenRefreshBlockedUntilByKey.set(key, Date.now() + cooldownMs);
+        tokenRefreshErrorByKey.set(key, `Token 刷新 HTTP 429，${formatCooldown(cooldownMs)}`);
+        return null;
+      }
+      if (!res.ok) { continue; }
+      const json = await res.json() as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      if (json.access_token) {
+        tokenRefreshBlockedUntilByKey.delete(key);
+        tokenRefreshErrorByKey.delete(key);
+        return {
+          accessToken: json.access_token,
+          refreshToken: json.refresh_token,
+          expiresIn: json.expires_in,
+          tokenUsed: refreshToken,
+        };
+      }
+    }
+    tokenRefreshErrorByKey.set(key, lastStatus ? `Token 刷新失败 HTTP ${lastStatus}` : 'Token 刷新失败');
+    return null;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    tokenRefreshErrorByKey.set(key, message || 'Token 刷新失败');
+    return null;
+  }
+}
+
+function persistRefreshedOAuthToken(accountName: string, refreshed: OAuthTokenRefreshResult): void {
+  try {
+    const config = loadConfig();
+    const credPath = getAccountCredPath(accountName);
+    const creds = readCredentialsFile(credPath);
+    if (!creds?.claudeAiOauth) { return; }
+
     const updated: Credentials = {
       claudeAiOauth: {
         ...creds.claudeAiOauth,
-        accessToken: json.access_token,
-        refreshToken: json.refresh_token ?? refreshTokens[refreshTokens.length - 1] ?? refreshToken,
-        expiresAt: json.expires_in ? Date.now() + json.expires_in * 1000 : undefined,
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken || refreshed.tokenUsed,
+        expiresAt: refreshed.expiresIn ? Date.now() + refreshed.expiresIn * 1000 : undefined,
       },
     };
     writeJsonFileAtomic(credPath, updated);
 
     // 如果是当前激活账户，同步更新 ~/.claude/.credentials.json
-    if (config.currentAccount === accountName) {
+    if (config.currentAccount === accountName && !config.currentApiProvider) {
       const active = readCredentialsFile(CLAUDE_CREDS) ?? {};
       active.claudeAiOauth = updated.claudeAiOauth;
       writeJsonFileAtomic(CLAUDE_CREDS, active);
     }
-
-    return json.access_token;
-  } catch {
-    return null;
-  }
+  } catch {}
 }
 
 // ─── 使用量 API ───────────────────────────────────────────────────────────────
@@ -660,6 +736,12 @@ function parseRetryAfterMs(value: string | null): number | undefined {
     return Math.max(0, dateMs - Date.now());
   }
   return undefined;
+}
+
+function parseRetryAfterMsHeader(value: string | null): number | undefined {
+  if (!value) { return undefined; }
+  const ms = Number(value);
+  return Number.isFinite(ms) ? Math.max(0, ms) : undefined;
 }
 
 function formatCooldown(ms: number): string {
@@ -858,10 +940,7 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
     data &&
     !isCurrentAccount &&
     !refreshedBeforeUsage &&
-    data.five_hour.utilization === 0 &&
-    data.seven_day.utilization === 0 &&
-    !data.five_hour.resets_at &&
-    !data.seven_day.resets_at
+    isEmptyQuotaWindow(data)
   ) {
     const refreshedToken = await refreshOAuthToken(accountName);
     if (refreshedToken) {
@@ -876,6 +955,14 @@ async function getUsage(accountName: string, force = false): Promise<UsageData |
     } else {
       error = `${error ?? `HTTP ${status}`}，Token 刷新失败`;
     }
+  }
+  if (data && !isCurrentAccount && isEmptyQuotaWindow(data)) {
+    if (cached) {
+      usageErrorByAccount.set(accountName, '官方未返回额度窗口，保留上次成功缓存');
+      return cached.data;
+    }
+    usageErrorByAccount.set(accountName, '官方未返回额度窗口，暂无可信缓存');
+    return null;
   }
   if (data) {
     setStoredUsageCache(accountName, data);
