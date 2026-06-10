@@ -1064,6 +1064,36 @@ function formatResetTime(resetsAt: string | undefined): string {
   return `${m}分钟后重置`;
 }
 
+function formatQuotaTiming(window: UsageWindow, cache?: StoredUsageCache, isCurrentAccount = false): {
+  description: string;
+  tooltip: string;
+  tooltipPrefix: string;
+} {
+  const reset = formatResetTime(window.resets_at);
+  if (reset) {
+    return {
+      description: `重置 ${reset}`,
+      tooltip: `重置: ${reset}`,
+      tooltipPrefix: reset,
+    };
+  }
+
+  if (cache && !isCurrentAccount) {
+    const nextRefresh = formatUsageCacheTime(getNextQuotaRefreshAt(cache));
+    return {
+      description: `下次刷新 ${nextRefresh}`,
+      tooltip: `官方未返回重置时间\n缓存下次刷新: ${nextRefresh}`,
+      tooltipPrefix: `下次刷新 ${nextRefresh}`,
+    };
+  }
+
+  return {
+    description: '',
+    tooltip: '重置时间未知',
+    tooltipPrefix: '重置时间未知',
+  };
+}
+
 // ─── 使用量百分比格式化 ───────────────────────────────────────────────────────
 
 function pct(n: number): string {
@@ -1510,12 +1540,15 @@ function buildUsageHtml(
       const displayName = escapeHtml(info?.displayName ?? name);
       const safeName = escapeHtml(name);
       const usageError = usage ? '' : usageErrorByAccount.get(name);
+      const quotaCache = getStoredUsageCache(name);
+      const config = loadConfig();
+      const isCurrentQuotaAccount = name === detectCurrentAccount(config) && !config.currentApiProvider;
 
       const sessionPct = usage ? usage.five_hour.utilization : null;
       const weeklyPct = usage ? usage.seven_day.utilization : null;
       const sonnetPct = usage?.seven_day_sonnet?.utilization ?? null;
-      const sessionReset = formatResetTime(usage?.five_hour?.resets_at);
-      const weeklyReset = formatResetTime(usage?.seven_day?.resets_at);
+      const sessionReset = usage ? formatQuotaTiming(usage.five_hour, quotaCache, isCurrentQuotaAccount).tooltipPrefix : '';
+      const weeklyReset = usage ? formatQuotaTiming(usage.seven_day, quotaCache, isCurrentQuotaAccount).tooltipPrefix : '';
       const sonnetReset = formatResetTime(usage?.seven_day_sonnet?.resets_at);
 
       const makeBar = (val: number | null, label: string, sub: string) => {
@@ -1979,8 +2012,8 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
             }]
           : [];
         return [
-          this.buildQuotaNode('Session', usage.five_hour),
-          this.buildQuotaNode('Weekly', usage.seven_day),
+          this.buildQuotaNode('Session', usage.five_hour, quotaCache, isCurrentQuotaAccount),
+          this.buildQuotaNode('Weekly', usage.seven_day, quotaCache, isCurrentQuotaAccount),
           ...quotaMetaNodes,
           ...errorNodes,
           ...tokenNodes,
@@ -2027,6 +2060,10 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         const plan = formatPlanLabel(info?.plan);
         const subscriptionDate = formatProfileDate(info?.subscriptionCreatedAt, true);
         const billingType = formatBillingType(info?.billingType);
+        const quotaCache = getStoredUsageCache(account.name);
+        const isCurrentQuotaAccount = account.name === currentAccount && !currentProvider;
+        const fiveHourTiming = usage ? formatQuotaTiming(usage.five_hour, quotaCache, isCurrentQuotaAccount) : undefined;
+        const weeklyTiming = usage ? formatQuotaTiming(usage.seven_day, quotaCache, isCurrentQuotaAccount) : undefined;
         const description = [
           plan,
           subscriptionDate ? `订阅 ${subscriptionDate}` : '',
@@ -2038,8 +2075,8 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
           billingType ? `计费类型: ${billingType}` : '',
           info?.subscriptionCreatedAt ? `订阅创建: ${formatProfileDate(info.subscriptionCreatedAt)}` : '',
           info?.organization ? `额度层级/组织: ${info.organization}` : '',
-          usage ? `5 小时额度: ${Math.round(usage.five_hour.utilization)}% (${formatResetTime(usage.five_hour.resets_at) || '重置时间未知'})` : '',
-          usage ? `7 天额度: ${Math.round(usage.seven_day.utilization)}% (${formatResetTime(usage.seven_day.resets_at) || '重置时间未知'})` : '',
+          usage && fiveHourTiming ? `5 小时额度: ${Math.round(usage.five_hour.utilization)}% (${fiveHourTiming.tooltipPrefix})` : '',
+          usage && weeklyTiming ? `7 天额度: ${Math.round(usage.seven_day.utilization)}% (${weeklyTiming.tooltipPrefix})` : '',
         ].filter(Boolean).join('\n');
         return { kind: 'account', label, accountName: account.name, description, tooltip: tooltipParts };
       });
@@ -2061,17 +2098,17 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
     return [];
   }
 
-  private buildQuotaNode(label: string, window: UsageWindow): TreeNode {
+  private buildQuotaNode(label: string, window: UsageWindow, cache?: StoredUsageCache, isCurrentAccount = false): TreeNode {
     const pctValue = Math.round(window.utilization);
     const bar = this.renderUsageBar(pctValue);
-    const reset = formatResetTime(window.resets_at);
+    const timing = formatQuotaTiming(window, cache, isCurrentAccount);
     return {
       kind: 'quota',
       label: `${label.padEnd(7)} ${bar} ${pctValue}%`,
-      description: reset ? `重置 ${reset}` : '',
+      description: timing.description,
       tooltip: [
         `${label} 已用: ${pctValue}%`,
-        reset ? `重置: ${reset}` : '重置时间未知',
+        timing.tooltip,
       ].join('\n'),
       icon: pctValue >= 95 ? 'warning' : (pctValue >= 70 ? 'flame' : 'pulse'),
     };
