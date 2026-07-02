@@ -280,15 +280,13 @@ function writeJsonFileAtomic(filePath: string, data: unknown): void {
 
 function getApiProvidersEditorData(config = loadConfig()): Record<string, unknown> {
   return {
-    note: '编辑 apiProviders 数组后保存此文件，CC Manager 会自动同步。可一次配置多个 Anthropic 兼容端点。',
     apiProviders: config.apiProviders ?? [],
     currentApiProvider: config.currentApiProvider ?? '',
-    example: {
-      name: 'provider-name',
-      baseUrl: 'https://example.com/v1',
-      apiKey: 'sk-...',
-      model: 'claude-sonnet-4-20250514'
-    }
+    help: [
+      '在 apiProviders 数组中添加一个或多个对象，保存后 CC Manager 会自动同步。',
+      '字段: name, baseUrl, apiKey, model(可选), description(可选)。',
+      '示例对象: {"name":"provider-a","baseUrl":"https://example.com/v1","apiKey":"sk-...","model":"claude-sonnet-4-20250514"}'
+    ],
   };
 }
 
@@ -296,15 +294,66 @@ function writeApiProvidersEditorFile(config = loadConfig()): void {
   writeJsonFileAtomic(API_PROVIDERS_FILE, getApiProvidersEditorData(config));
 }
 
+function ensureApiProvidersEditorFile(config = loadConfig()): void {
+  if (!fs.existsSync(API_PROVIDERS_FILE)) {
+    writeApiProvidersEditorFile(config);
+    return;
+  }
+  try {
+    const content = fs.readFileSync(API_PROVIDERS_FILE, 'utf-8');
+    if (!content.trim()) {
+      writeApiProvidersEditorFile(config);
+    }
+  } catch {
+    writeApiProvidersEditorFile(config);
+  }
+}
+
+function isEditedProviderExample(value: unknown): boolean {
+  const raw = value as Partial<ApiProvider> | undefined;
+  const name = String(raw?.name ?? '').trim();
+  const baseUrl = String(raw?.baseUrl ?? '').trim();
+  const apiKey = String(raw?.apiKey ?? '').trim();
+  return Boolean(
+    name &&
+    baseUrl &&
+    apiKey &&
+    name !== 'provider-name' &&
+    baseUrl !== 'https://example.com/v1' &&
+    apiKey !== 'sk-...'
+  );
+}
+
+function getProviderEntriesForImport(value: unknown): unknown[] {
+  const parsed = value as { apiProviders?: unknown; providers?: unknown; example?: unknown };
+  if (Array.isArray(parsed.apiProviders) && parsed.apiProviders.length > 0) {
+    return parsed.apiProviders;
+  }
+  if (Array.isArray(parsed.providers) && parsed.providers.length > 0) {
+    return parsed.providers;
+  }
+  if (isEditedProviderExample(parsed.example)) {
+    return [parsed.example];
+  }
+  if (Array.isArray(parsed.apiProviders)) {
+    return parsed.apiProviders;
+  }
+  if (Array.isArray(parsed.providers)) {
+    return parsed.providers;
+  }
+  if (isEditedProviderExample(parsed)) {
+    return [parsed];
+  }
+  throw new Error('apiProviders 必须是数组');
+}
+
 function validateApiProviders(value: unknown): { providers: ApiProvider[]; currentApiProvider?: string } {
   const parsed = value as { apiProviders?: unknown; currentApiProvider?: unknown };
-  if (!Array.isArray(parsed?.apiProviders)) {
-    throw new Error('apiProviders 必须是数组');
-  }
+  const entries = getProviderEntriesForImport(value);
 
   const seen = new Set<string>();
   const providers: ApiProvider[] = [];
-  for (const [index, item] of parsed.apiProviders.entries()) {
+  for (const [index, item] of entries.entries()) {
     const raw = item as Partial<ApiProvider> | undefined;
     const name = String(raw?.name ?? '').trim();
     const baseUrl = String(raw?.baseUrl ?? '').trim();
@@ -335,26 +384,39 @@ function validateApiProviders(value: unknown): { providers: ApiProvider[]; curre
   };
 }
 
+function applyApiProvidersFromParsedData(parsed: unknown): number {
+  const { providers, currentApiProvider } = validateApiProviders(parsed);
+  const config = loadConfig();
+  const previousCurrent = config.currentApiProvider;
+  config.apiProviders = providers;
+  config.currentApiProvider = currentApiProvider ?? (
+    previousCurrent && providers.some((p) => p.name === previousCurrent)
+      ? previousCurrent
+      : undefined
+  );
+  saveConfig(config);
+  accountTreeProvider?.refresh();
+  accountStatusProvider?.refresh();
+  refreshStatusBar();
+  return providers.length;
+}
+
+function syncApiProvidersFromFileIfPresent(): void {
+  if (!fs.existsSync(API_PROVIDERS_FILE)) { return; }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(API_PROVIDERS_FILE, 'utf-8')) as unknown;
+    applyApiProvidersFromParsedData(parsed);
+  } catch {}
+}
+
 async function syncApiProvidersFromDocument(document: vscode.TextDocument): Promise<void> {
   const filePath = path.normalize(document.uri.fsPath);
   if (filePath !== path.normalize(API_PROVIDERS_FILE)) { return; }
 
   try {
     const parsed = JSON.parse(document.getText()) as unknown;
-    const { providers, currentApiProvider } = validateApiProviders(parsed);
-    const config = loadConfig();
-    const previousCurrent = config.currentApiProvider;
-    config.apiProviders = providers;
-    config.currentApiProvider = currentApiProvider ?? (
-      previousCurrent && providers.some((p) => p.name === previousCurrent)
-        ? previousCurrent
-        : undefined
-    );
-    saveConfig(config);
-    accountTreeProvider?.refresh();
-    accountStatusProvider?.refresh();
-    refreshStatusBar();
-    vscode.window.showInformationMessage(`已同步 ${providers.length} 个 API Provider`);
+    const count = applyApiProvidersFromParsedData(parsed);
+    vscode.window.showInformationMessage(`已同步 ${count} 个 API Provider`);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`API Providers 配置未同步: ${message}`);
@@ -3503,7 +3565,7 @@ async function commandAddApiProvider(): Promise<void> {
 
 async function commandEditApiProviders(): Promise<void> {
   try {
-    writeApiProvidersEditorFile();
+    ensureApiProvidersEditorFile();
     const document = await vscode.workspace.openTextDocument(vscode.Uri.file(API_PROVIDERS_FILE));
     await vscode.window.showTextDocument(document, { preview: false });
     vscode.window.showInformationMessage('编辑 apiProviders 数组后保存文件，即可同步 API Providers');
@@ -3617,6 +3679,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   accountTreeProvider.refresh();
   accountStatusProvider.refresh();
+  syncApiProvidersFromFileIfPresent();
 
   refreshStatusBar();
   autoRefreshTimer = setInterval(() => {
