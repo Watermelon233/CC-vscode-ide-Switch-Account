@@ -2,7 +2,7 @@
   "name": "claude-account-switcher",
   "displayName": "CC Manager",
   "description": "管理多个 Claude Code 官方账号并查看额度与本地用量",
-  "version": "0.1.34",
+  "version": "0.1.35",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"

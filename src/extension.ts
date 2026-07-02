@@ -395,6 +395,9 @@ function applyApiProvidersFromParsedData(parsed: unknown): number {
       : undefined
   );
   saveConfig(config);
+  if (config.currentApiProvider) {
+    switchToApiProvider(config.currentApiProvider);
+  }
   accountTreeProvider?.refresh();
   accountStatusProvider?.refresh();
   refreshStatusBar();
