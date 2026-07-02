@@ -10,6 +10,7 @@ const HOME = os.homedir();
 const SWITCH_DIR = path.join(HOME, '.cc-subscription-switch');
 const ACCOUNTS_DIR = path.join(SWITCH_DIR, 'accounts');
 const CONFIG_FILE = path.join(SWITCH_DIR, 'config.json');
+const API_PROVIDERS_FILE = path.join(SWITCH_DIR, 'api-providers.json');
 const CLAUDE_DIR = path.join(HOME, '.claude');
 const CLAUDE_CREDS = path.join(CLAUDE_DIR, '.credentials.json');
 const CLAUDE_SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
@@ -275,6 +276,89 @@ function writeJsonFileAtomic(filePath: string, data: unknown): void {
   const tempPath = `${filePath}.${Date.now()}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
   fs.renameSync(tempPath, filePath);
+}
+
+function getApiProvidersEditorData(config = loadConfig()): Record<string, unknown> {
+  return {
+    note: '编辑 apiProviders 数组后保存此文件，CC Manager 会自动同步。可一次配置多个 Anthropic 兼容端点。',
+    apiProviders: config.apiProviders ?? [],
+    currentApiProvider: config.currentApiProvider ?? '',
+    example: {
+      name: 'provider-name',
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'sk-...',
+      model: 'claude-sonnet-4-20250514'
+    }
+  };
+}
+
+function writeApiProvidersEditorFile(config = loadConfig()): void {
+  writeJsonFileAtomic(API_PROVIDERS_FILE, getApiProvidersEditorData(config));
+}
+
+function validateApiProviders(value: unknown): { providers: ApiProvider[]; currentApiProvider?: string } {
+  const parsed = value as { apiProviders?: unknown; currentApiProvider?: unknown };
+  if (!Array.isArray(parsed?.apiProviders)) {
+    throw new Error('apiProviders 必须是数组');
+  }
+
+  const seen = new Set<string>();
+  const providers: ApiProvider[] = [];
+  for (const [index, item] of parsed.apiProviders.entries()) {
+    const raw = item as Partial<ApiProvider> | undefined;
+    const name = String(raw?.name ?? '').trim();
+    const baseUrl = String(raw?.baseUrl ?? '').trim();
+    const apiKey = String(raw?.apiKey ?? '').trim();
+    const model = String(raw?.model ?? '').trim();
+    const description = String(raw?.description ?? '').trim();
+
+    if (!name) { throw new Error(`第 ${index + 1} 个 Provider 缺少 name`); }
+    if (seen.has(name)) { throw new Error(`Provider 名称重复: ${name}`); }
+    if (!baseUrl) { throw new Error(`Provider "${name}" 缺少 baseUrl`); }
+    if (!/^https?:\/\//i.test(baseUrl)) { throw new Error(`Provider "${name}" 的 baseUrl 必须以 http:// 或 https:// 开头`); }
+    if (!apiKey) { throw new Error(`Provider "${name}" 缺少 apiKey`); }
+
+    seen.add(name);
+    providers.push({
+      name,
+      baseUrl,
+      apiKey,
+      model: model || undefined,
+      description: description || undefined,
+    });
+  }
+
+  const current = String(parsed.currentApiProvider ?? '').trim();
+  return {
+    providers,
+    currentApiProvider: current && seen.has(current) ? current : undefined,
+  };
+}
+
+async function syncApiProvidersFromDocument(document: vscode.TextDocument): Promise<void> {
+  const filePath = path.normalize(document.uri.fsPath);
+  if (filePath !== path.normalize(API_PROVIDERS_FILE)) { return; }
+
+  try {
+    const parsed = JSON.parse(document.getText()) as unknown;
+    const { providers, currentApiProvider } = validateApiProviders(parsed);
+    const config = loadConfig();
+    const previousCurrent = config.currentApiProvider;
+    config.apiProviders = providers;
+    config.currentApiProvider = currentApiProvider ?? (
+      previousCurrent && providers.some((p) => p.name === previousCurrent)
+        ? previousCurrent
+        : undefined
+    );
+    saveConfig(config);
+    accountTreeProvider?.refresh();
+    accountStatusProvider?.refresh();
+    refreshStatusBar();
+    vscode.window.showInformationMessage(`已同步 ${providers.length} 个 API Provider`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`API Providers 配置未同步: ${message}`);
+  }
 }
 
 function isUsageData(value: unknown): value is UsageData {
@@ -2402,6 +2486,13 @@ class ClaudeAccountsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         },
         {
           kind: 'action',
+          label: '编辑 API Providers',
+          description: '批量粘贴配置',
+          commandId: 'claude-switcher.editProviders',
+          icon: 'json',
+        },
+        {
+          kind: 'action',
           label: '打开用量统计',
           description: '全局面板',
           commandId: 'claude-switcher.usage',
@@ -3323,8 +3414,9 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
 
 async function commandAddApiProvider(): Promise<void> {
   // 先选择预设或自定义
-  type PresetOption = { label: string; description: string; preset?: ProviderPreset; isCustom: boolean };
+  type PresetOption = { label: string; description: string; preset?: ProviderPreset; isCustom: boolean; editFile?: boolean };
   const presetOptions: PresetOption[] = [
+    { label: '$(json) 编辑配置文件', description: '适合复制粘贴长 URL/SK 或批量配置多个端点', isCustom: false, editFile: true },
     ...PROVIDER_PRESETS.map((p) => ({
       label: '$(zap) ' + p.name,
       description: p.description,
@@ -3338,6 +3430,10 @@ async function commandAddApiProvider(): Promise<void> {
     placeHolder: '选择预设或自定义 Provider',
   });
   if (!selectedPreset) {return;}
+  if (selectedPreset.editFile) {
+    await commandEditApiProviders();
+    return;
+  }
 
   let name: string;
   let baseUrl: string;
@@ -3401,6 +3497,20 @@ async function commandAddApiProvider(): Promise<void> {
 
   vscode.window.showInformationMessage(`API Provider "${name}" 已添加`);
   accountTreeProvider?.refresh();
+}
+
+// ─── 命令：编辑 API Providers 配置 ──────────────────────────────────────────────
+
+async function commandEditApiProviders(): Promise<void> {
+  try {
+    writeApiProvidersEditorFile();
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(API_PROVIDERS_FILE));
+    await vscode.window.showTextDocument(document, { preview: false });
+    vscode.window.showInformationMessage('编辑 apiProviders 数组后保存文件，即可同步 API Providers');
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`打开 API Providers 配置失败: ${message}`);
+  }
 }
 
 // ─── 命令：切换到 API Provider ─────────────────────────────────────────────────
@@ -3528,6 +3638,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claude-switcher.whoami', commandWhoami),
     vscode.commands.registerCommand('claude-switcher.usage', commandUsage),
     vscode.commands.registerCommand('claude-switcher.addProvider', commandAddApiProvider),
+    vscode.commands.registerCommand('claude-switcher.editProviders', commandEditApiProviders),
     vscode.commands.registerCommand('claude-switcher.switchProvider', commandSwitchApiProvider),
     vscode.commands.registerCommand('claude-switcher.removeProvider', commandRemoveApiProvider),
     vscode.commands.registerCommand('claude-switcher.refresh', () => {
@@ -3538,6 +3649,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claude-switcher.switchToProvider', commandSwitchToProvider),
     vscode.commands.registerCommand('claude-switcher.removeAccountNode', commandRemoveAccountNode),
     vscode.commands.registerCommand('claude-switcher.renameAccountNode', commandRenameAccountNode)
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      void syncApiProvidersFromDocument(document);
+    })
   );
 }
 
